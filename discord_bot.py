@@ -3,6 +3,8 @@ import requests
 import aiohttp
 import asyncio
 from datetime import datetime
+from flask import Flask
+from threading import Thread
 
 # CONFIGURATION - PASTE YOUR TOKENS HERE
 DISCORD_BOT_TOKEN = "ODU0NjgwOTE2MTQ4MzU1MTMy.Gx-HHD.52w4B-SvYBlAXDEkTgl3jCUGYO6KfjiteCHMxU"
@@ -11,6 +13,17 @@ TELEGRAM_CHAT_ID = "8591595853"
 
 client = discord.Client()
 
+# Flask Web Server setup to satisfy Render's port checks completely
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive and running 24/7!"
+
+def run_flask():
+    # Flask runs on port 10000 which Render scans automatically
+    app.run(host='0.0.0.0', port=10000)
+    
 async def send_telegram_notification(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
@@ -61,15 +74,9 @@ async def on_member_join(member):
     await send_telegram_notification(alert_text)
 
 
-# 1-LINE MODIFICATION: Lightweight port listener to satisfy Render's web traffic checks
-async def dummy_web_server():
-    server = await asyncio.start_server(lambda r, w: w.close(), '0.0.0.0', 10000)
-    async with server: 
-        await server.serve_forever()
-
-async def main():
-    # Run the web server and the Discord client side-by-side concurrently
-    await asyncio.gather(dummy_web_server(), client.start(DISCORD_BOT_TOKEN))
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Start the web server in a separate thread so it doesn't block Discord
+    Thread(target=run_flask).start()
+    
+    # Run the Discord bot
+    client.run(DISCORD_BOT_TOKEN)
