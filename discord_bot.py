@@ -61,4 +61,15 @@ async def on_member_join(member):
     await send_telegram_notification(alert_text)
 
 
-client.run(DISCORD_BOT_TOKEN)
+# 1-LINE MODIFICATION: Lightweight port listener to satisfy Render's web traffic checks
+async def dummy_web_server():
+    server = await asyncio.start_server(lambda r, w: w.close(), '0.0.0.0', 10000)
+    async with server: 
+        await server.serve_forever()
+
+async def main():
+    # Run the web server and the Discord client side-by-side concurrently
+    await asyncio.gather(dummy_web_server(), client.start(DISCORD_BOT_TOKEN))
+
+if __name__ == "__main__":
+    asyncio.run(main())
