@@ -30,7 +30,7 @@ async def send_telegram_notification(message):
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
-        "parse_mode": None
+        #"parse_mode": None
     }
 
     for attempt in range(3):
