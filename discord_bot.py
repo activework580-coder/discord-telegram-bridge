@@ -7,7 +7,7 @@ from flask import Flask
 from threading import Thread
 
 # CONFIGURATION - PASTE YOUR TOKENS HERE
-DISCORD_BOT_TOKEN = "ODU0NjgwOTE2MTQ4MzU1MTMy.GiCFYD.62J_HoA1DjQPJ6oke5O3zigokWe8uUjTBAn1ZM"
+DISCORD_BOT_TOKEN = "ODU0NjgwOTE2MTQ4MzU1MTMy.GQ-TVY.L6xu1TO39SHLbnA9GG40iuTBAYg4ILHW4xe3Wg"
 TELEGRAM_BOT_TOKEN = "8897870104:AAFc1JvCIam8lWbUhyJsyIZPe8wUwc5ObJw"
 TELEGRAM_CHAT_ID = "8591595853"
 
@@ -30,7 +30,7 @@ async def send_telegram_notification(message):
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
-        "parse_mode": "Markdown"
+        "parse_mode": None
     }
 
     for attempt in range(3):
