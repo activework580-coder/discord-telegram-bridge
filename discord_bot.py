@@ -64,10 +64,10 @@ async def on_member_join(member):
     username = member.name
 
     alert_text = (
-        f"🚨 **New Discord Join Detected!**\n\n"
-        f"🏠 **Server Name:** {server_name}\n"
-        f"👤 **User:** {username}\n"
-        f"⏰ **Time Joined:** {join_time} (Local Time)"
+        f"🚨 New Discord Join Detected!\n\n"
+        f"🏠 Server Name:** {server_name}\n"
+        f"👤 User: {username}\n"
+        f"⏰ Time Joined: {join_time} (Local Time)"
     )
 
     print(f"[Event Caught] User {username} joined {server_name}. Sending alert...")
