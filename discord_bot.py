@@ -487,7 +487,7 @@ class AccountManager:
                 logger.info(f"📱 Loaded {len(accounts)} accounts from tokens.txt")
             except Exception as e:
                 logger.error(f"Error loading tokens.txt: {e}")
-        
+
         # Fallback to single token from environment
         if not accounts:
             token = os.getenv("DISCORD_TOKEN", "")
@@ -556,4 +556,3 @@ if __name__ == "__main__":
         print("\n🛑 Interrupted")
     except Exception as e:
         print(f"❌ Error: {e}")
-                
