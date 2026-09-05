@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Tier 3 Server Join Monitor – FULLY FIXED
-- Proper curl_cffi WebSocket frame handling
-- Guild cache populated from GUILD_CREATE events
+Tier 3 Server Join Monitor – COMPLETE FIX
+- Proper Opcode 14 payload with string guild_id
+- Guild name extraction from GUILD_CREATE
 """
 
 import asyncio
@@ -19,7 +19,6 @@ from flask import Flask, jsonify
 from curl_cffi import requests as curl_requests
 from curl_cffi.requests import WebSocket
 
-# ===== LOGGING =====
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -27,13 +26,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ===== CONFIGURATION =====
 TELEGRAM_BOT_TOKEN = "8897870104:AAFc1JvCIam8lWbUhyJsyIZPe8wUwc5ObJw"
 TELEGRAM_CHAT_ID = "8591595853"
 PROXY_URL = os.getenv("PROXY_URL", None)
 HEARTBEAT_JITTER = 0.15
 
-# ===== FLASK WEB SERVER =====
 app = Flask(__name__)
 
 @app.route('/')
@@ -47,7 +44,6 @@ def health():
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.getenv("PORT", 10000)))
 
-# ===== TELEGRAM SERVICE =====
 class TelegramService:
     def __init__(self):
         self._session = None
@@ -82,7 +78,6 @@ class TelegramService:
         if self._session:
             await self._session.close()
 
-# ===== FINGERPRINT GENERATOR =====
 def generate_installation_id(token: str) -> str:
     hasher = hashlib.md5(token.encode('utf-8')).hexdigest()
     return f"{hasher[0:8]}-{hasher[8:12]}-{hasher[12:16]}-{hasher[16:20]}-{hasher[20:32]}"
@@ -112,7 +107,6 @@ def generate_fingerprint(account_index: int, token: str = None):
         "installation_id": installation_id
     }
 
-# ===== DISCORD GATEWAY =====
 class DiscordGateway:
     def __init__(self, token: str, label: str, account_index: int, telegram: TelegramService):
         self.token = token
@@ -128,7 +122,7 @@ class DiscordGateway:
         self._heartbeat_task = None
         self._reconnect_attempt = 0
         self.is_connected = False
-        self._guilds = {}  # guild_id -> guild_name
+        self._guilds = {}
         self._invalid_token = False
         self._ready_received = False
         self._subscribed_guilds = set()
@@ -177,18 +171,14 @@ class DiscordGateway:
             try:
                 raw = await asyncio.wait_for(self.ws.recv(), timeout=35)
                 
-                # === FIX 1: Proper curl_cffi WebSocket frame handling ===
-                # curl_cffi returns a WebSocketFrame object or tuple
+                # Proper WebSocket frame handling
                 if hasattr(raw, 'data'):
-                    # It's a WebSocketFrame object
                     message_data = raw.data
                 elif isinstance(raw, tuple) and len(raw) >= 1:
-                    # It's a tuple (data, opcode)
                     message_data = raw[0]
                 else:
                     message_data = raw
                 
-                # Decode the message
                 if isinstance(message_data, bytes):
                     message = message_data.decode('utf-8', errors='ignore')
                 elif isinstance(message_data, str):
@@ -248,11 +238,15 @@ class DiscordGateway:
                     logger.error(f"⚠️ {self.label}: Error: {e}")
                     continue
 
-    async def _subscribe_to_guild(self, guild_id: str):
+    async def _subscribe_to_guild(self, guild_id: str, guild_name: str = None):
+        """Send Opcode 14 subscription for a guild."""
+        # Ensure guild_id is a string
+        guild_id_str = str(guild_id)
+        
         lazy_subscription = {
             "op": 14,
             "d": {
-                "guild_id": guild_id,
+                "guild_id": guild_id_str,
                 "typing": True,
                 "threads": True,
                 "activities": True,
@@ -261,8 +255,8 @@ class DiscordGateway:
             }
         }
         await self.ws.send(json.dumps(lazy_subscription))
-        self._subscribed_guilds.add(guild_id)
-        logger.info(f"📡 {self.label}: Subscribed to guild {guild_id}")
+        self._subscribed_guilds.add(guild_id_str)
+        logger.info(f"📡 {self.label}: Subscribed to guild {guild_id_str} ({guild_name or 'Unknown'})")
 
     async def _handle_event(self, event_type: str, data: dict):
         logger.info(f"🔍 {self.label} RECEIVED: {event_type}")
@@ -271,40 +265,37 @@ class DiscordGateway:
             self._ready_received = True
             guilds = data.get('guilds', [])
             
-            # === FIX 2: Initialize guild cache with IDs (names will come from GUILD_CREATE) ===
+            # Initialize guild cache
             for g in guilds:
                 guild_id = g.get('id')
                 if guild_id:
-                    # Store placeholder name, will be updated by GUILD_CREATE
-                    self._guilds[guild_id] = g.get('name', 'Unknown')
+                    self._guilds[str(guild_id)] = g.get('name', 'Unknown')
             
             user = data.get('user', {})
             logger.info(f"✅ {self.label}: Connected as {user.get('username')} monitoring {len(self._guilds)} servers")
             await self.telegram.send(f"✅ {self.label} online, monitoring {len(self._guilds)} servers", self.label)
             
-            # Subscribe to all guilds
-            logger.info(f"📡 {self.label}: Subscribing to {len(guilds)} guilds for member events...")
+            # Subscribe to all guilds with stagger
+            logger.info(f"📡 {self.label}: Subscribing to {len(guilds)} guilds...")
             for idx, guild in enumerate(guilds):
                 guild_id = guild.get('id')
                 if guild_id:
+                    guild_name = guild.get('name', 'Unknown')
                     stagger_delay = random.uniform(0.5, 1.2)
                     await asyncio.sleep(stagger_delay)
-                    await self._subscribe_to_guild(guild_id)
-            
-            logger.info(f"✅ {self.label}: Subscribed to {len(self._subscribed_guilds)} guilds")
+                    await self._subscribe_to_guild(guild_id, guild_name)
 
-        # === FIX 2: Intercept GUILD_CREATE to populate guild names ===
         elif event_type == 'GUILD_CREATE':
             guild_id = data.get('id')
             guild_name = data.get('name', 'Unknown')
             if guild_id:
-                self._guilds[guild_id] = guild_name
+                self._guilds[str(guild_id)] = guild_name
                 logger.info(f"📋 {self.label}: Guild cache updated: {guild_id} -> {guild_name}")
 
         elif event_type == 'GUILD_MEMBER_ADD':
             guild_id = data.get('guild_id')
             user = data.get('user', {})
-            guild_name = self._guilds.get(guild_id, "Unknown Server")
+            guild_name = self._guilds.get(str(guild_id), "Unknown Server")
             username = user.get('username', 'Unknown')
             
             alert = (
@@ -376,7 +367,6 @@ class DiscordGateway:
         if self._session:
             await self._session.close()
 
-# ===== ACCOUNT MANAGER =====
 class AccountManager:
     def __init__(self):
         self.accounts = []
@@ -428,10 +418,9 @@ class AccountManager:
             await g.close()
         await self.telegram.close()
 
-# ===== MAIN =====
 async def main():
     print("=" * 50)
-    print("🤖 Tier 3 Server Join Monitor - FULLY FIXED")
+    print("🤖 Tier 3 Server Join Monitor - COMPLETE FIX")
     print("=" * 50)
     
     threading.Thread(target=run_flask, daemon=True).start()
