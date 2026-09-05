@@ -363,32 +363,32 @@ class DiscordGateway:
                 await self._on_member_join(guild_id, user)
 
     async def _send_identify(self):
-    fingerprint = generate_fingerprint(self.account_index)
-    payload = {
-        "op": 2,
-        "d": {
-            "token": self.token,
-            "properties": fingerprint,
-            "compress": False,
-            "large_threshold": 250,
-            "presence": {
-                "status": "online",
-                "since": 0,
-                "activities": [],
-                "afk": False
-            },
-            "client_state": {
-                "guild_versions": {},
-                "highest_last_message_id": "0",
-                "read_state_version": 0,
-                "user_guild_settings_version": -1,
-                "user_settings_version": -1
-            },
-            "guild_subscriptions": True  # <-- ADD THIS LINE
+        fingerprint = generate_fingerprint(self.account_index)
+        payload = {
+            "op": 2,
+            "d": {
+                "token": self.token,
+                "properties": fingerprint,
+                "compress": False,
+                "large_threshold": 250,
+                "presence": {
+                    "status": "online",
+                    "since": 0,
+                    "activities": [],
+                    "afk": False
+                },
+                "client_state": {
+                    "guild_versions": {},
+                    "highest_last_message_id": "0",
+                    "read_state_version": 0,
+                    "user_guild_settings_version": -1,
+                    "user_settings_version": -1
+                },
+                "guild_subscriptions": True  # <-- ADD THIS LINE
+            }
         }
-    }
-    await self.ws.send(json.dumps(payload))
-    
+        await self.ws.send(json.dumps(payload))
+
     async def _send_heartbeat(self):
         if random.random() < 0.02:
             return
