@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Clean Tier 3 Server Join Monitor
-Monitors server joins and sends Telegram notifications
+Clean Tier 3 Server Join Monitor – FIXED
+Now receives guilds in READY event
 """
 
 import asyncio
@@ -23,9 +23,8 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = "8897870104:AAFc1JvCIam8lWbUhyJsyIZPe8wUwc5ObJw"
 TELEGRAM_CHAT_ID = "8591595853"
-MAX_ACCOUNTS = 999
-HEARTBEAT_JITTER = 0.15
 PROXY_URL = os.getenv("PROXY_URL", None)
+HEARTBEAT_JITTER = 0.15
 
 app = Flask(__name__)
 
@@ -76,12 +75,12 @@ class TelegramService:
 
 def generate_fingerprint(account_index: int):
     random.seed(account_index * 777 + 13)
-    fingerprint = {
+    return {
         "os": "Windows",
         "browser": "Chrome",
         "device": "",
         "system_locale": "en-US",
-        "browser_user_agent": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "browser_version": "126.0.0.0",
         "os_version": "10.0.22621",
         "referrer": "",
@@ -95,7 +94,6 @@ def generate_fingerprint(account_index: int):
         "launch_signature": base64.b64encode(random.randbytes(8)).decode('utf-8'),
         "has_client_mods": False
     }
-    return fingerprint
 
 class DiscordGateway:
     def __init__(self, token: str, label: str, account_index: int, telegram: TelegramService):
@@ -204,9 +202,12 @@ class DiscordGateway:
                     logger.error(f"⚠️ {self.label}: Error: {e}")
 
     async def _handle_event(self, event_type: str, data: dict):
+        logger.info(f"🔍 {self.label} RECEIVED: {event_type}")
+
         if event_type == 'READY':
+            # CRITICAL: Extract guilds from READY
             guilds = data.get('guilds', [])
-            self._guilds = {g['id']: g['name'] for g in guilds if 'name' in g}
+            self._guilds = {g['id']: g.get('name', 'Unknown') for g in guilds if 'id' in g}
             user = data.get('user', {})
             logger.info(f"✅ {self.label}: Connected as {user.get('username')} monitoring {len(self._guilds)} servers")
             await self.telegram.send(f"✅ {self.label} online, monitoring {len(self._guilds)} servers", self.label)
@@ -236,7 +237,7 @@ class DiscordGateway:
                 "properties": fingerprint,
                 "compress": False,
                 "large_threshold": 250,
-                "guild_subscriptions": True,
+                "guild_subscriptions": True,  # CRITICAL: Needed to receive guilds
                 "presence": {"status": "online", "since": 0, "activities": [], "afk": False},
                 "client_state": {
                     "guild_versions": {},
