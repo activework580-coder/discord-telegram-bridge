@@ -4,6 +4,7 @@ Server Join Monitor – Using discord.py-self
 Reliably detects GUILD_MEMBER_ADD with user tokens
 """
 
+import os
 import discord
 import asyncio
 import aiohttp
