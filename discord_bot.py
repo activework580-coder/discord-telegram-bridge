@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Tier 3 Server Join Monitor
-Uses the exact same gateway logic as discord.py for user tokens
+Upgraded from discord.py to Tier 3 stealth – WITH CAPABILITIES & FULL CLIENT STATE
+Now receives GUILD_MEMBER_ADD events with user tokens
 """
 
 import asyncio
@@ -19,6 +20,7 @@ from flask import Flask, jsonify
 from curl_cffi import requests as curl_requests
 from curl_cffi.requests import WebSocket
 
+# ===== LOGGING =====
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -26,6 +28,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ===== CONFIGURATION =====
 TELEGRAM_BOT_TOKEN = "8897870104:AAFc1JvCIam8lWbUhyJsyIZPe8wUwc5ObJw"
 TELEGRAM_CHAT_ID = "8591595853"
 MAX_ACCOUNTS = 999
@@ -34,8 +37,12 @@ READY_TIMEOUT = 15
 
 PROXY_URL = os.getenv("PROXY_URL", None)
 
+# ===== FLASK WEB SERVER =====
 app = Flask(__name__)
-stats = {"total_accounts": 0, "connected_accounts": 0}
+stats = {
+    "total_accounts": 0,
+    "connected_accounts": 0
+}
 
 @app.route('/')
 def home():
@@ -53,6 +60,7 @@ def health():
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.getenv("PORT", 10000)))
 
+# ===== TELEGRAM SERVICE =====
 class TelegramService:
     def __init__(self):
         self._session = None
@@ -92,6 +100,7 @@ class TelegramService:
         if self._session:
             await self._session.close()
 
+# ===== FINGERPRINT GENERATOR (FULLY MATCHES discord.py + PDF) =====
 def generate_fingerprint(account_index: int) -> Dict[str, Any]:
     random.seed(account_index * 777 + 13)
     os_versions = ["10.0.19045", "10.0.22621", "10.0.22000", "10.0.20348"]
@@ -109,18 +118,20 @@ def generate_fingerprint(account_index: int) -> Dict[str, Any]:
         "browser_user_agent": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{browser_versions[account_index % len(browser_versions)]} Safari/537.36",
         "browser_version": browser_versions[account_index % len(browser_versions)],
         "os_version": os_versions[account_index % len(os_versions)],
+        "client_build_number": build_numbers[account_index % len(build_numbers)],
+        "architecture": "x64" if account_index % 2 == 0 else "arm64",
+        "launch_signature": base64.b64encode(random.randbytes(8)).decode('utf-8'),
+        "has_client_mods": False,
+        # CRITICAL: Fields required for user accounts to receive GUILD_MEMBER_ADD
         "referrer": "",
         "referring_domain": "",
         "referrer_current": "",
         "referring_domain_current": "",
         "release_channel": "stable",
-        "client_build_number": build_numbers[account_index % len(build_numbers)],
-        "client_event_source": None,
-        "architecture": "x64" if account_index % 2 == 0 else "arm64",
-        "launch_signature": base64.b64encode(random.randbytes(8)).decode('utf-8'),
-        "has_client_mods": False
+        "client_event_source": None
     }
 
+# ===== DISCORD GATEWAY (PART 1) =====
 class DiscordGateway:
     def __init__(self, token: str, label: str, account_index: int, telegram: TelegramService):
         self.token = token
@@ -141,7 +152,6 @@ class DiscordGateway:
         self._last_heartbeat_ack = time.time()
         self._ready_received = False
         self._guilds = {}
-        self._user_id = None
 
     def _generate_device_id(self) -> str:
         seed = f"{self.token}_{self.account_index}_{time.time() // 86400}"
@@ -233,8 +243,7 @@ class DiscordGateway:
             self.is_connected = False
             if self.ws:
                 await self.ws.close()
-
-    async def _receive_loop(self):
+            async def _receive_loop(self):
         ready_timer = asyncio.create_task(self._ready_timeout())
 
         while self._running:
@@ -352,7 +361,6 @@ class DiscordGateway:
         if event_type == 'READY':
             self._guilds = {g['id']: {'name': g['name']} for g in event_data.get('guilds', [])}
             user = event_data.get('user', {})
-            self._user_id = user.get('id')
             username = user.get('username', 'Unknown')
             logger.info(f"✅ {self.label}: Connected as {username} monitoring {len(self._guilds)} servers")
             await self.telegram.send(f"✅ {self.label} online, monitoring {len(self._guilds)} servers", self.label)
@@ -366,10 +374,20 @@ class DiscordGateway:
 
     async def _send_identify(self):
         fingerprint = generate_fingerprint(self.account_index)
+        fingerprint.update({
+            "referrer": "",
+            "referring_domain": "",
+            "referrer_current": "",
+            "referring_domain_current": "",
+            "release_channel": "stable",
+            "client_event_source": None
+        })
+
         payload = {
             "op": 2,
             "d": {
                 "token": self.token,
+                "capabilities": 8189,  # CRITICAL: Matches real browser client
                 "properties": fingerprint,
                 "compress": False,
                 "large_threshold": 250,
@@ -385,12 +403,14 @@ class DiscordGateway:
                     "highest_last_message_id": "0",
                     "read_state_version": 0,
                     "user_guild_settings_version": -1,
-                    "user_settings_version": -1
+                    "user_settings_version": 0,          # <-- Changed from -1
+                    "private_channels_version": 0,       # <-- Added
+                    "api_code_version": 0                # <-- Added
                 }
             }
         }
         await self.ws.send(json.dumps(payload))
-        logger.info(f"🔵 {self.label}: IDENTIFY sent with guild_subscriptions=True")
+        logger.info(f"🔵 {self.label}: IDENTIFY sent with capabilities & full client_state")
 
     async def _send_heartbeat(self):
         if random.random() < 0.02:
@@ -454,6 +474,7 @@ class DiscordGateway:
         if self._session:
             await self._session.close()
 
+# ===== ACCOUNT MANAGER =====
 class AccountManager:
     def __init__(self):
         self.accounts: List[Dict[str, str]] = []
@@ -477,7 +498,7 @@ class AccountManager:
                 logger.info(f"📱 Loaded {len(accounts)} accounts from tokens.txt")
             except Exception as e:
                 logger.error(f"Error loading tokens.txt: {e}")
-        
+
         if not accounts:
             token = os.getenv("DISCORD_TOKEN", "")
             if token:
@@ -521,6 +542,7 @@ class AccountManager:
             await gateway.close()
         await self.telegram.close()
 
+# ===== MAIN =====
 async def main():
     print("=" * 60)
     print("🤖 Server Join Monitor - Tier 3 (Chrome TLS Spoofed)")
