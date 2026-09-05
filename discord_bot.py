@@ -236,7 +236,8 @@ class DiscordGateway:
             self.is_connected = False
             if self.ws:
                 await self.ws.close()
-       async def _receive_loop(self):
+
+    async def _receive_loop(self):
         ready_timer = asyncio.create_task(self._ready_timeout())
 
         while self._running:
