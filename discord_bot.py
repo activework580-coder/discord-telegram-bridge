@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Tier 3 Server Join Monitor
-Upgraded from discord.py to Tier 3 stealth
+Upgraded from discord.py to Tier 3 stealth – FULLY FIXED
 Monitors server joins and sends Telegram notifications
 """
 
@@ -100,7 +100,7 @@ class TelegramService:
         if self._session:
             await self._session.close()
 
-# ===== FINGERPRINT GENERATOR =====
+# ===== FINGERPRINT GENERATOR (FULLY MATCHES discord.py) =====
 def generate_fingerprint(account_index: int) -> Dict[str, Any]:
     random.seed(account_index * 777 + 13)
     os_versions = ["10.0.19045", "10.0.22621", "10.0.22000", "10.0.20348"]
@@ -121,7 +121,14 @@ def generate_fingerprint(account_index: int) -> Dict[str, Any]:
         "client_build_number": build_numbers[account_index % len(build_numbers)],
         "architecture": "x64" if account_index % 2 == 0 else "arm64",
         "launch_signature": base64.b64encode(random.randbytes(8)).decode('utf-8'),
-        "has_client_mods": False
+        "has_client_mods": False,
+        # CRITICAL: These fields are required for user accounts to receive GUILD_MEMBER_ADD
+        "referrer": "",
+        "referring_domain": "",
+        "referrer_current": "",
+        "referring_domain_current": "",
+        "release_channel": "stable",
+        "client_event_source": None
     }
 
 # ===== DISCORD GATEWAY (PART 1) =====
@@ -349,6 +356,9 @@ class DiscordGateway:
         event_type = data.get('t')
         event_data = data.get('d', {})
 
+        # === EVENT LOGGER – shows all incoming events ===
+        logger.info(f"🔍 {self.label} received event: {event_type}")
+
         if event_type == 'READY':
             self._guilds = {g['id']: {'name': g['name']} for g in event_data.get('guilds', [])}
             user = event_data.get('user', {})
@@ -364,6 +374,7 @@ class DiscordGateway:
 
     async def _send_identify(self):
         fingerprint = generate_fingerprint(self.account_index)
+        # Ensure all required fields are present (they are in the fingerprint)
         payload = {
             "op": 2,
             "d": {
@@ -371,6 +382,7 @@ class DiscordGateway:
                 "properties": fingerprint,
                 "compress": False,
                 "large_threshold": 250,
+                "guild_subscriptions": True,  # CRITICAL for GUILD_MEMBER_ADD
                 "presence": {
                     "status": "online",
                     "since": 0,
@@ -383,11 +395,11 @@ class DiscordGateway:
                     "read_state_version": 0,
                     "user_guild_settings_version": -1,
                     "user_settings_version": -1
-                },
-                "guild_subscriptions": True  # <-- ADD THIS LINE
+                }
             }
         }
         await self.ws.send(json.dumps(payload))
+        logger.info(f"🔵 {self.label}: IDENTIFY sent with guild_subscriptions=True")
 
     async def _send_heartbeat(self):
         if random.random() < 0.02:
@@ -476,6 +488,7 @@ class AccountManager:
             except Exception as e:
                 logger.error(f"Error loading tokens.txt: {e}")
         
+        # Fallback to single token from environment
         if not accounts:
             token = os.getenv("DISCORD_TOKEN", "")
             if token:
@@ -543,3 +556,4 @@ if __name__ == "__main__":
         print("\n🛑 Interrupted")
     except Exception as e:
         print(f"❌ Error: {e}")
+                
