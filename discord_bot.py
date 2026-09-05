@@ -13,7 +13,7 @@ from datetime import datetime
 from flask import Flask, jsonify
 
 # ===== CONFIGURATION =====
-DISCORD_TOKEN = "YOUR_USER_TOKEN_HERE"          # Replace with your user token
+DISCORD_TOKEN = "MTI1MTkyODY3NTE2MzgzNjU2MA.GqpILO.tDRKP_6PIbtOxgr0DMglU_8o3IN2jDUi29gK1I"          # Replace with your user token
 TELEGRAM_BOT_TOKEN = "8897870104:AAFc1JvCIam8lWbUhyJsyIZPe8wUwc5ObJw"
 TELEGRAM_CHAT_ID = "8591595853"
 
