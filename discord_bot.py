@@ -677,84 +677,91 @@ class DiscordGateway:
                 await self._set_state(ConnectionState.FAILED)
 
     async def _receive_loop(self):
-        """Main receive loop – waits indefinitely (no timeout)."""
-        while self._running and not self._invalid_token:
-            try:
-                # FIX: No timeout – wait forever for messages
-                raw = await self.ws.recv()
+    """Main receive loop – waits indefinitely (no timeout)."""
+    while self._running and not self._invalid_token:
+        try:
+            raw = await self.ws.recv()
 
-                if hasattr(raw, 'data'):
-                    message_data = raw.data
-                elif isinstance(raw, tuple) and len(raw) >= 1:
-                    message_data = raw[0]
-                else:
-                    message_data = raw
+            if hasattr(raw, 'data'):
+                message_data = raw.data
+            elif isinstance(raw, tuple) and len(raw) >= 1:
+                message_data = raw[0]
+            else:
+                message_data = raw
 
-                if isinstance(message_data, bytes):
-                    message = message_data.decode('utf-8', errors='ignore')
-                elif isinstance(message_data, str):
-                    message = message_data
-                else:
-                    continue
+            if isinstance(message_data, bytes):
+                message = message_data.decode('utf-8', errors='ignore')
+            elif isinstance(message_data, str):
+                message = message_data
+            else:
+                continue
 
-                if not message:
-                    continue
+            if not message:
+                continue
 
-                data = json.loads(message)
-                op = data.get('op')
-                t = data.get('t')
-                d = data.get('d', {})
+            data = json.loads(message)
+            op = data.get('op')
+            t = data.get('t')
+            d = data.get('d', {})
 
-                if data.get('s') is not None:
-                    self._seq = data['s']
+            # === DIAGNOSTIC: Log every dispatch event ===
+            if op == 0:
+                logger.warning(
+                    "%s RAW DISPATCH: t=%r seq=%r",
+                    self.label,
+                    t,
+                    data.get("s"),
+                )
+            # ============================================
 
-                if op == 0:
-                    await self._handle_event(t, d)
-                elif op == 1:
-                    await self._send_heartbeat()
-                elif op == 7:
-                    logger.info(f"🔄 {self.label}: Server requested reconnect")
-                    self._should_resume = True
-                    await self._reconnect()
-                    return
-                elif op == 9:
-                    if d is False:
-                        logger.error(f"❌ {self.label}: Invalid token")
-                        await self.telegram.send(f"❌ {self.label} token is invalid", self.label)
-                        self._invalid_token = True
-                        await self._set_state(ConnectionState.FAILED)
-                        return
-                    else:
-                        if self._session_id and self._seq:
-                            await self._send_resume()
-                            await self._set_state(ConnectionState.RESUMING)
-                        else:
-                            await self._send_identify()
-                            await self._set_state(ConnectionState.IDENTIFYING)
-                elif op == 10:
-                    # HELLO – start heartbeat
-                    self._heartbeat_interval = d['heartbeat_interval'] / 1000.0
-                    if self._heartbeat_task:
-                        self._heartbeat_task.cancel()
-                    self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-                    await self._send_identify()
-                    await self._set_state(ConnectionState.IDENTIFYING)
-                elif op == 11:
-                    # Heartbeat ACK – reset health timer
-                    self._last_heartbeat_ack = time.time()
+            if data.get('s') is not None:
+                self._seq = data['s']
 
-            except websockets.exceptions.ConnectionClosed as e:
-                logger.warning(f"⚠️ {self.label}: Connection closed: {e}")
+            if op == 0:
+                await self._handle_event(t, d)
+            elif op == 1:
+                await self._send_heartbeat()
+            elif op == 7:
+                logger.info(f"🔄 {self.label}: Server requested reconnect")
+                self._should_resume = True
                 await self._reconnect()
                 return
-            except Exception as e:
-                if "closed" in str(e).lower():
-                    logger.warning(f"⚠️ {self.label}: Connection closed")
-                    await self._reconnect()
+            elif op == 9:
+                if d is False:
+                    logger.error(f"❌ {self.label}: Invalid token")
+                    await self.telegram.send(f"❌ {self.label} token is invalid", self.label)
+                    self._invalid_token = True
+                    await self._set_state(ConnectionState.FAILED)
                     return
                 else:
-                    logger.error(f"⚠️ {self.label}: Error: {e}")
-                    continue
+                    if self._session_id and self._seq:
+                        await self._send_resume()
+                        await self._set_state(ConnectionState.RESUMING)
+                    else:
+                        await self._send_identify()
+                        await self._set_state(ConnectionState.IDENTIFYING)
+            elif op == 10:
+                self._heartbeat_interval = d['heartbeat_interval'] / 1000.0
+                if self._heartbeat_task:
+                    self._heartbeat_task.cancel()
+                self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+                await self._send_identify()
+                await self._set_state(ConnectionState.IDENTIFYING)
+            elif op == 11:
+                self._last_heartbeat_ack = time.time()
+
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.warning(f"⚠️ {self.label}: Connection closed: {e}")
+            await self._reconnect()
+            return
+        except Exception as e:
+            if "closed" in str(e).lower():
+                logger.warning(f"⚠️ {self.label}: Connection closed")
+                await self._reconnect()
+                return
+            else:
+                logger.error(f"⚠️ {self.label}: Error: {e}")
+                continue
 
     async def _subscribe_to_guild(self, guild_id: str, guild_name: str = None):
         guild_id_str = str(guild_id)
