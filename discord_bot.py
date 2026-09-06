@@ -450,6 +450,7 @@ def health():
 
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.getenv("PORT", 10000)))
+
 # ===== TELEGRAM SERVICE =====
 class TelegramService:
     def __init__(self):
@@ -592,7 +593,7 @@ class DiscordGateway:
             f"🚨 New Discord Join!\n\n"
             f"🏠 Server: {guild_name}\n"
             f"👤 User: {candidate.username or 'Unknown'}\n"
-            f"🕐 Time: datetime.now().strftime('%Y-%m-%d %H:%M:%S')\n"
+            f"🕐 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"📊 Score: {candidate.score} | Evidence: {evidence_str}"
         )
         await self.telegram.send(alert, self.label)
