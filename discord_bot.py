@@ -14,6 +14,7 @@ All fixes applied:
 import asyncio
 import json
 import os
+import websockets
 import random
 import time
 import base64
