@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """
 Tier 3 Server Join Monitor – COMPLETE FINAL SCRIPT
-All 12 points applied + generic state/inference/notification subsystem
-- Neutral MemberObservation dataclass
-- Explicit synchronization states
-- Epoch-based snapshot generations
-- Baseline built without alerts
-- Separate observation from inference
-- JoinInferenceEngine with evidence scoring
-- Atomic deduplication with INSERT OR IGNORE
-- Notification lifecycle: PENDING → SENDING → SENT / FAILED
-- Evidence stored with candidate
-- Protocol-based synchronization (no sleep(2))
+All fixes applied:
+- No receive timeout (wait indefinitely for messages)
+- Heartbeat ACK-based liveness monitoring
+- MINIMUM_SCORE = 2
+- RECENT_THRESHOLD_SECONDS = 300
+- Fallback baseline completion timer
+- Debug logging for inference engine
+- Full state/inference/notification subsystem
 """
 
 import asyncio
@@ -25,6 +22,7 @@ import logging
 import threading
 import html
 import sqlite3
+import websockets
 from datetime import datetime, timezone
 from enum import Enum
 from dataclasses import dataclass, field
@@ -47,8 +45,9 @@ TELEGRAM_CHAT_ID = "8591595853"
 PROXY_URL = os.getenv("PROXY_URL", None)
 HEARTBEAT_JITTER = 0.15
 DB_PATH = "monitor.db"
-RECENT_THRESHOLD_SECONDS = 60
-MINIMUM_SCORE = 3
+RECENT_THRESHOLD_SECONDS = 300  # Increased from 60
+MINIMUM_SCORE = 2  # Lowered from 3
+BASELINE_TIMEOUT_SECONDS = 10  # Fallback baseline completion
 
 # ===== TIME UTILITY =====
 def utc_now() -> datetime:
@@ -349,10 +348,13 @@ class JoinInferenceEngine:
         self.minimum_score = minimum_score
 
     def evaluate(self, observation: MemberObservation, sync: GuildSync, previously_known: bool) -> Optional[JoinCandidate]:
+        # Debug logging
         if sync.state != SyncState.MONITORING:
+            logger.debug(f"🔍 {observation.guild_id}: Not MONITORING (state={sync.state.value})")
             return None
 
         if observation.operation != "INSERT":
+            logger.debug(f"🔍 {observation.guild_id}: Not INSERT (operation={observation.operation})")
             return None
 
         evidence = []
@@ -369,8 +371,10 @@ class JoinInferenceEngine:
                 score += 2
 
         if score < self.minimum_score:
+            logger.debug(f"🔍 {observation.guild_id}: Score too low ({score} < {self.minimum_score}), evidence={evidence}")
             return None
 
+        logger.debug(f"🔍 {observation.guild_id}: Candidate generated! score={score}, evidence={evidence}")
         return JoinCandidate(
             guild_id=observation.guild_id,
             user_id=observation.user_id,
@@ -500,13 +504,6 @@ class TelegramService:
         if self._session:
             await self._session.close()
 
-# ===== TELEGRAM DISPATCHER SEND FUNCTION =====
-async def send_telegram_callback(candidate: JoinCandidate):
-    """Send Telegram notification for a join candidate."""
-    guild_name = candidate.guild_id  # Will be resolved in the gateway
-    # Note: guild_name resolution happens in the gateway's handle_event
-    # This is a placeholder; the gateway will override this
-
 # ===== FINGERPRINT GENERATOR =====
 def generate_installation_id(token: str) -> str:
     hasher = hashlib.md5(token.encode('utf-8')).hexdigest()
@@ -572,12 +569,14 @@ class DiscordGateway:
         self._session_id = None
         self._heartbeat_interval = 41.25
         self._heartbeat_task = None
+        self._connected = False
         self._last_heartbeat_ack = time.time()
         self._last_heartbeat_sent = 0
 
         # Guild state
         self._guilds = {}  # guild_id -> guild_name
         self._guild_epochs = {}
+        self._baseline_timers = {}  # guild_id -> asyncio.Task
 
         # Reconnect state
         self._reconnect_attempt = 0
@@ -655,10 +654,14 @@ class DiscordGateway:
                 headers=headers
             )
             logger.info(f"🔌 {self.label}: Connected")
+            self._connected = True
 
             if self._heartbeat_task:
                 self._heartbeat_task.cancel()
                 self._heartbeat_task = None
+
+            # Wait for HELLO before starting heartbeat
+            # The heartbeat is started in _receive_loop when op == 10
 
             await self._receive_loop()
 
@@ -673,9 +676,11 @@ class DiscordGateway:
                 await self._set_state(ConnectionState.FAILED)
 
     async def _receive_loop(self):
+        """Main receive loop – waits indefinitely (no timeout)."""
         while self._running and not self._invalid_token:
             try:
-                raw = await asyncio.wait_for(self.ws.recv(), timeout=35)
+                # FIX: No timeout – wait forever for messages
+                raw = await self.ws.recv()
 
                 if hasattr(raw, 'data'):
                     message_data = raw.data
@@ -709,6 +714,7 @@ class DiscordGateway:
                 elif op == 7:
                     logger.info(f"🔄 {self.label}: Server requested reconnect")
                     self._should_resume = True
+                    await self._reconnect()
                     return
                 elif op == 9:
                     if d is False:
@@ -725,6 +731,7 @@ class DiscordGateway:
                             await self._send_identify()
                             await self._set_state(ConnectionState.IDENTIFYING)
                 elif op == 10:
+                    # HELLO – start heartbeat
                     self._heartbeat_interval = d['heartbeat_interval'] / 1000.0
                     if self._heartbeat_task:
                         self._heartbeat_task.cancel()
@@ -732,18 +739,17 @@ class DiscordGateway:
                     await self._send_identify()
                     await self._set_state(ConnectionState.IDENTIFYING)
                 elif op == 11:
+                    # Heartbeat ACK – reset health timer
                     self._last_heartbeat_ack = time.time()
 
-            except asyncio.TimeoutError:
-                logger.warning(f"⚠️ {self.label}: Receive timeout")
-                self._should_resume = True
+            except websockets.exceptions.ConnectionClosed as e:
+                logger.warning(f"⚠️ {self.label}: Connection closed: {e}")
+                await self._reconnect()
                 return
-            except json.JSONDecodeError as e:
-                logger.warning(f"⚠️ {self.label}: JSON decode error: {e}")
-                continue
             except Exception as e:
                 if "closed" in str(e).lower():
                     logger.warning(f"⚠️ {self.label}: Connection closed")
+                    await self._reconnect()
                     return
                 else:
                     logger.error(f"⚠️ {self.label}: Error: {e}")
@@ -765,6 +771,15 @@ class DiscordGateway:
         }
         await self.ws.send(json.dumps(lazy_subscription))
         logger.info(f"📡 {self.label}: Subscribed to guild {guild_id_str} ({guild_name or 'Unknown'})")
+
+    async def _baseline_timeout(self, guild_id: str, epoch: int):
+        """Fallback: complete baseline after N seconds if Discord doesn't signal completion."""
+        await asyncio.sleep(BASELINE_TIMEOUT_SECONDS)
+        sync = await self.state_manager.get_guild_sync(guild_id)
+        if sync.state == SyncState.BUILDING and sync.epoch == epoch:
+            await self.state_manager.mark_baseline_complete(guild_id, epoch)
+            await self.state_manager.start_monitoring(guild_id, epoch)
+            logger.info(f"📊 {self.label}: Guild {guild_id} baseline complete (fallback, epoch {epoch})")
 
     async def _handle_event(self, event_type: str, data: dict):
         logger.info(f"🔍 {self.label} RECEIVED: {event_type}")
@@ -798,6 +813,10 @@ class DiscordGateway:
                     stagger_delay = random.uniform(0.5, 1.2)
                     await asyncio.sleep(stagger_delay)
                     await self._subscribe_to_guild(guild_id, guild_name)
+                    # Start fallback baseline timer
+                    self._baseline_timers[guild_id] = asyncio.create_task(
+                        self._baseline_timeout(guild_id, sync.epoch)
+                    )
 
         elif event_type == 'GUILD_CREATE':
             guild_id = str(data.get('id'))
@@ -808,6 +827,10 @@ class DiscordGateway:
                 if sync.state != SyncState.BUILDING:
                     sync = await self.state_manager.begin_resync(guild_id)
                 logger.info(f"📋 {self.label}: Guild {guild_id} ({sync.epoch}) - BUILDING baseline")
+                # Start fallback baseline timer
+                self._baseline_timers[guild_id] = asyncio.create_task(
+                    self._baseline_timeout(guild_id, sync.epoch)
+                )
 
         elif event_type == 'GUILD_MEMBER_LIST_UPDATE':
             guild_id = str(data.get('guild_id'))
@@ -817,7 +840,7 @@ class DiscordGateway:
             guild_sync = await self.state_manager.get_guild_sync(guild_id)
             current_epoch = guild_sync.epoch
 
-            # Check for sync completion (protocol-based baseline)
+            # Protocol-based baseline completion detection
             has_more = data.get('more', False)
             sync_complete = data.get('sync', False) or not has_more
 
@@ -876,12 +899,20 @@ class DiscordGateway:
                                 logger.info(f"🚪 {self.label}: Member {user_id} left {guild_name}")
 
                     elif op_type == 'INVALIDATE':
+                        # Cancel any pending baseline timer
+                        if guild_id in self._baseline_timers:
+                            self._baseline_timers[guild_id].cancel()
+                            del self._baseline_timers[guild_id]
                         await self.state_manager.begin_resync(guild_id)
                         guild_sync = await self.state_manager.get_guild_sync(guild_id)
                         logger.info(f"🔄 {self.label}: Invalidated {guild_name} - epoch {guild_sync.epoch}")
 
             # Protocol-based baseline completion
             if sync_complete and guild_sync.state == SyncState.BUILDING:
+                # Cancel any pending baseline timer
+                if guild_id in self._baseline_timers:
+                    self._baseline_timers[guild_id].cancel()
+                    del self._baseline_timers[guild_id]
                 completed = await self.state_manager.mark_baseline_complete(guild_id, current_epoch)
                 if completed:
                     await self.state_manager.start_monitoring(guild_id, current_epoch)
@@ -930,11 +961,21 @@ class DiscordGateway:
         await self.ws.send(json.dumps({"op": 1, "d": self._seq}))
 
     async def _heartbeat_loop(self):
+        """Heartbeat loop with jitter."""
         while self._running:
             jitter = 1 + random.uniform(-HEARTBEAT_JITTER, HEARTBEAT_JITTER)
             await asyncio.sleep(self._heartbeat_interval * jitter)
             if self._running and self.state in [ConnectionState.READY, ConnectionState.IDENTIFYING]:
                 await self._send_heartbeat()
+
+    async def _reconnect(self):
+        if not self._running or self._invalid_token:
+            return
+        self._reconnect_attempt += 1
+        wait = min(60, (2 ** min(self._reconnect_attempt, 4)) + random.uniform(0, 5))
+        logger.info(f"🔄 {self.label}: Reconnect in {wait:.1f}s")
+        await asyncio.sleep(wait)
+        await self._connect()
 
     async def close(self):
         self._running = False
@@ -1018,3 +1059,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nStopped")
+
+
+
