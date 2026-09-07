@@ -181,43 +181,77 @@ class DiscordGateway:
             else:
                 await self._reconnect()
 
+    async def _extract_message(self, raw):
+        """Extract and clean message from various WebSocket response formats"""
+        message = None
+        
+        try:
+            # Handle different raw message types
+            if raw is None:
+                return None
+                
+            # If it's a tuple, get the first element
+            if isinstance(raw, tuple):
+                if len(raw) > 0:
+                    raw = raw[0]
+                else:
+                    return None
+            
+            # If it has a data attribute (WebSocket message object)
+            if hasattr(raw, "data"):
+                raw = raw.data
+            
+            # Convert bytes to string
+            if isinstance(raw, bytes):
+                message = raw.decode('utf-8', errors='ignore')
+            elif isinstance(raw, str):
+                message = raw
+            else:
+                message = str(raw)
+            
+            # Clean up the message
+            if message:
+                # Remove b'...' wrapping if present
+                if message.startswith("b'") and message.endswith("'"):
+                    message = message[2:-1]
+                elif message.startswith('b"') and message.endswith('"'):
+                    message = message[2:-1]
+                
+                # Unescape quotes
+                message = message.replace('\\"', '"')
+                message = message.strip()
+            
+            return message
+            
+        except Exception as e:
+            logger.error(f"{self.label}: Error extracting message: {e}")
+            return None
+
     async def _receive_loop(self):
         while self._running:
             try:
                 raw = await asyncio.wait_for(self.ws.recv(), timeout=45)
-                if raw is None:
-                    continue
                 
-                # Handle different raw message types
-                if isinstance(raw, tuple):
-                    binary_payload = raw if len(raw) > 0 else b""
-                elif hasattr(raw, "data"):
-                    binary_payload = raw.data
-                else:
-                    binary_payload = raw
-
-                # Convert to string
-                if isinstance(binary_payload, bytes):
-                    message = binary_payload.decode('utf-8', errors='ignore').strip()
-                else:
-                    message = str(binary_payload).strip()
-
-                # Skip empty messages
+                # Extract and clean the message
+                message = await self._extract_message(raw)
+                
                 if not message:
-                    logger.debug(f"{self.label}: Received empty message, skipping...")
+                    logger.debug(f"{self.label}: Received empty or invalid message, skipping...")
                     continue
 
                 # Try to parse JSON
                 try:
                     data = json.loads(message)
                 except json.JSONDecodeError as e:
-                    logger.warning(f"{self.label}: Failed to parse JSON: {e} | Message preview: {message[:100]}")
-                    # If it's an opcode 11 heartbeat ACK, it might be just "11"
-                    if message.isdigit():
-                        op = int(message)
+                    # Check if it's a simple numeric opcode
+                    if message.strip().isdigit():
+                        op = int(message.strip())
                         if op == 11:
                             logger.debug(f"{self.label}: Received heartbeat ACK (op 11)")
                             continue
+                    
+                    logger.warning(f"{self.label}: Failed to parse JSON: {e}")
+                    logger.debug(f"{self.label}: Raw message: {message[:500]}")
                     continue
 
                 # Process the message
@@ -244,15 +278,13 @@ class DiscordGateway:
                     else:
                         await self._send_identity()
                 elif op == 10:
-                    self._heartbeat_interval = d['heartbeat_interval'] / 1000.0
+                    self._heartbeat_interval = d.get('heartbeat_interval', 41250) / 1000.0
                     await self._send_identity()
                     self._connected = True
                     self.is_connected = True
-                    logger.info(f"{self.label}: Handshake authorization validated.")
+                    logger.info(f"{self.label}: Handshake authorization validated. Heartbeat: {self._heartbeat_interval}s")
                 elif op == 11:
-                    # Heartbeat ACK - just log at debug level
-                    logger.debug(f"{self.label}: Heartbeat ACK received")
-                    pass
+                    logger.debug(f"{self.label}: Heartbeat ACK")
                 else:
                     logger.debug(f"{self.label}: Unhandled opcode {op}")
                     
@@ -267,8 +299,7 @@ class DiscordGateway:
                     return
                 else:
                     logger.error(f"{self.label}: Exception in receive loop: {e}")
-                    await asyncio.sleep(1)  # Small delay before retry
-                    # Don't reconnect immediately for non-critical errors
+                    await asyncio.sleep(1)
 
     async def _heartbeat_loop(self):
         while self._running:
@@ -336,7 +367,7 @@ class DiscordGateway:
         try:
             await self.ws.send(json.dumps(lazy_subscription))
             self._subscribed_guilds.add(guild_id)
-            logger.info(f"{self.label}: Opcode 14 Lazy-Guild Subscription sent for server ID {guild_id}")
+            logger.info(f"{self.label}: Subscribed to guild {guild_id}")
         except Exception as e:
             logger.error(f"{self.label}: Failed to subscribe to guild {guild_id}: {e}")
 
@@ -346,13 +377,12 @@ class DiscordGateway:
             guilds = data.get('guilds', [])
             for g in guilds:
                 if 'id' in g:
-                    self._guilds[g['id']] = g.get('name', 'Populating Name...')
+                    self._guilds[g['id']] = g.get('name', 'Unknown')
             user = data.get('user', {})
             username = user.get('username', 'Unknown')
-            logger.info(f"{self.label}: Initial gateway connection authenticated as {username}")
+            logger.info(f"{self.label}: Connected as {username}")
             await self.telegram.send(
-                f"✅ <b>Online</b> | Processing gateway room parameters...\n"
-                f"👤 User: <code>{username}</code>",
+                f"✅ <b>Online</b> | Connected as <code>{username}</code>",
                 self.label
             )
             for guild in guilds:
@@ -366,41 +396,36 @@ class DiscordGateway:
             g_name = data.get('name')
             if g_id and g_name:
                 self._guilds[g_id] = g_name
-                logger.info(f"{self.label} Cache Synced: mapped ID {g_id} to name '{g_name}'")
+                logger.info(f"{self.label} Cached guild: {g_name} ({g_id})")
 
         elif event_type == 'GUILD_MEMBER_ADD':
             guild_id = data.get('guild_id')
             user = data.get('user', {})
-            guild_name = self._guilds.get(guild_id, f'Server ({guild_id})')
+            guild_name = self._guilds.get(guild_id, f'Server {guild_id}')
             username = user.get('username', 'Unknown')
             user_id = user.get('id', 'Unknown')
-            avatar_hash = user.get('avatar', '')
             
             alert = (
                 f"🆕 <b>New Discord Join!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🏠 <b>Server:</b> <code>{guild_name}</code>\n"
                 f"👤 <b>User:</b> <code>{username}</code>\n"
-                f"🆔 <b>User ID:</b> <code>{user_id}</code>\n"
+                f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"⏰ <b>Time:</b> <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
             )
             
-            if avatar_hash:
-                alert += f"🖼️ <b>Avatar:</b> <a href='https://cdn.discordapp.com/avatars/{user_id}/{avatar_hash}.png'>Link</a>\n"
-            
-            alert += f"━━━━━━━━━━━━━━━━━━━━\n"
-            alert += f"⏰ <b>Time:</b> <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
-            
-            logger.info(f"{self.label}: New member joined {guild_name} - {username} ({user_id})")
+            logger.info(f"{self.label}: New join: {username} -> {guild_name}")
             await self.telegram.send(alert, self.label)
 
     async def _reconnect(self):
-        logger.info(f"{self.label}: Attempting reconnection...")
+        logger.info(f"{self.label}: Reconnecting...")
         self._connected = False
         self.is_connected = False
         await self.close()
         self._reconnect_attempt += 1
         delay = min(30, 2 ** self._reconnect_attempt)
-        logger.info(f"{self.label}: Reconnecting in {delay} seconds...")
+        logger.info(f"{self.label}: Waiting {delay}s")
         await asyncio.sleep(delay)
 
     async def close(self):
@@ -414,12 +439,12 @@ class DiscordGateway:
         if self.ws:
             try:
                 await self.ws.close()
-            except Exception:
+            except:
                 pass
         if self._session:
             try:
                 await self._session.close()
-            except Exception:
+            except:
                 pass
 
 # ====== ACCOUNT MANAGER ======
@@ -430,7 +455,6 @@ class AccountManager:
         self.telegram = TelegramService()
 
     def load_accounts(self):
-        """Load Discord tokens from tokens.txt file"""
         if os.path.exists("tokens.txt"):
             try:
                 with open("tokens.txt", "r") as f:
@@ -439,38 +463,35 @@ class AccountManager:
                         if line and ":" in line:
                             name, token = line.split(":", 1)
                             self.accounts.append({"name": name.strip(), "token": token.strip()})
-                            logger.info(f"Loaded account: {name.strip()}")
+                            logger.info(f"Loaded: {name.strip()}")
             except Exception as e:
                 logger.error(f"Error reading tokens.txt: {e}")
         else:
-            logger.warning("tokens.txt file not found!")
-            
+            logger.warning("tokens.txt not found!")
         return self.accounts
 
     async def start_all(self):
         self.accounts = self.load_accounts()
         if not self.accounts:
-            logger.error("No accounts loaded from tokens.txt")
+            logger.error("No accounts loaded")
             await self.telegram.send(
                 "❌ <b>No Discord tokens found!</b>\n"
-                "Please create a <code>tokens.txt</code> file with format:\n"
-                "<code>AccountName:TOKEN_HERE</code>",
+                "Create <code>tokens.txt</code> with:\n"
+                "<code>Name:TOKEN</code>",
                 "System"
             )
             return
 
-        logger.info(f"Initializing tracking loops for {len(self.accounts)} accounts.")
+        logger.info(f"Starting {len(self.accounts)} monitors")
         await self.telegram.send(
-            f"🚀 <b>Starting {len(self.accounts)} server join monitors</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 <b>Status:</b> Initializing...",
+            f"🚀 <b>Starting {len(self.accounts)} monitors</b>",
             "System"
         )
 
         for idx, acc in enumerate(self.accounts):
             if idx > 0:
                 stagger = random.uniform(2, 5)
-                logger.info(f"Waiting {stagger:.1f}s before starting {acc['name']}")
+                logger.info(f"Waiting {stagger:.1f}s for {acc['name']}")
                 await asyncio.sleep(stagger)
             gateway = DiscordGateway(acc["token"], acc["name"], idx, self.telegram)
             self.gateways.append(gateway)
@@ -480,16 +501,7 @@ class AccountManager:
             await asyncio.sleep(60)
             connected = sum(1 for g in self.gateways if g.is_connected)
             total = len(self.gateways)
-            logger.info(f"Live Diagnostics: {connected}/{total} channels active.")
-            
-            if connected == total and total > 0:
-                await self.telegram.send(
-                    f"✅ <b>All systems operational</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📊 <b>Active Monitors:</b> <code>{connected}/{total}</code>\n"
-                    f"⏰ <b>Uptime:</b> <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>",
-                    "System"
-                )
+            logger.info(f"Status: {connected}/{total} connected")
 
     async def cleanup(self):
         for g in self.gateways:
@@ -499,14 +511,14 @@ class AccountManager:
 # ====== MAIN ======
 async def main():
     print("=" * 50)
-    print("■ Tier 3 Server Join Monitor - PRODUCTION READY")
+    print("■ Tier 3 Server Join Monitor")
     print("=" * 50)
     threading.Thread(target=run_flask, daemon=True).start()
     manager = AccountManager()
     try:
         await manager.start_all()
     except KeyboardInterrupt:
-        logger.info("Termination sequence initiated...")
+        logger.info("Shutting down...")
     finally:
         await manager.cleanup()
 
@@ -514,4 +526,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nProcess Closed Cleanly.")
+        print("\nClosed.")
