@@ -58,7 +58,6 @@ class TelegramNotifier:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
         try:
-            # Use curl_cffi for better compatibility
             from curl_cffi import requests as curl_requests
             response = curl_requests.post(url, json=payload, timeout=10, impersonate="chrome")
             if response.status_code == 200:
@@ -88,6 +87,7 @@ class DiscordGateway:
         self._reconnect_attempt = 0
         self._subscribed_guilds = set()
         self._gateway_url = None
+        self._buffer = b""  # For handling fragmented messages
         
     async def connect(self):
         """Connect to Discord WebSocket"""
@@ -105,14 +105,15 @@ class DiscordGateway:
         
         logger.info(f"{self.label}: 🔌 Connecting to Discord WebSocket...")
         try:
-            # Connect with headers using the correct method
+            # Connect with increased message size limit
             self.ws = await websockets.connect(
                 gateway_url,
                 user_agent_header="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                compression=None,
+                compression=None,  # Disable compression to avoid issues
                 ping_interval=20,
                 ping_timeout=10,
-                close_timeout=10
+                close_timeout=10,
+                max_size=2**26  # 64MB limit for large messages
             )
             logger.info(f"{self.label}: ✅ WebSocket connected")
         except Exception as e:
@@ -129,11 +130,9 @@ class DiscordGateway:
     
     async def _get_gateway_url_with_retry(self, max_retries=3):
         """Get gateway URL with retries and fallback URLs"""
-        # Try multiple gateway URLs
         gateway_options = [
             "https://discord.com/api/v9/gateway",
-            "https://discord.com/api/v10/gateway",
-            "https://gateway.discord.gg/"
+            "https://discord.com/api/v10/gateway"
         ]
         
         for attempt in range(max_retries):
@@ -151,7 +150,6 @@ class DiscordGateway:
                     logger.warning(f"{self.label}: Gateway attempt failed: {e}")
                     continue
             
-            # Wait before retry
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt
                 logger.info(f"{self.label}: Retrying in {wait_time}s...")
@@ -170,9 +168,11 @@ class DiscordGateway:
                 
                 # Handle different message types
                 if isinstance(message, bytes):
+                    # Try to decode as UTF-8
                     try:
                         message = message.decode('utf-8')
-                    except:
+                    except UnicodeDecodeError:
+                        # Try zlib decompression
                         try:
                             decompressed = zlib.decompress(message)
                             message = decompressed.decode('utf-8')
@@ -187,8 +187,10 @@ class DiscordGateway:
                 # Parse JSON
                 try:
                     data = json.loads(message)
-                except json.JSONDecodeError:
-                    logger.warning(f"{self.label}: Invalid JSON: {message[:100]}")
+                except json.JSONDecodeError as e:
+                    # Try to handle fragmented messages
+                    if len(message) > 0:
+                        logger.warning(f"{self.label}: Invalid JSON: {e}")
                     continue
                 
                 # Process the message
@@ -391,7 +393,7 @@ class DiscordGateway:
                     "activities": [],
                     "afk": False
                 },
-                "compress": False,
+                "compress": True,  # Enable compression for large payloads
                 "large_threshold": 250,
                 "client_state": {
                     "guild_versions": {},
@@ -403,8 +405,12 @@ class DiscordGateway:
             }
         }
         
-        await self.ws.send(json.dumps(identity))
-        logger.info(f"{self.label}: 🆔 Identity sent")
+        try:
+            await self.ws.send(json.dumps(identity))
+            logger.info(f"{self.label}: 🆔 Identity sent")
+        except Exception as e:
+            logger.error(f"{self.label}: Failed to send identity: {e}")
+            raise
     
     async def _resume_session(self):
         """Resume a previous session"""
@@ -511,7 +517,6 @@ class AccountManager:
                 logger.error(f"Error reading tokens.txt: {e}")
         else:
             logger.warning("tokens.txt not found!")
-            # Create sample tokens.txt
             with open("tokens.txt", "w") as f:
                 f.write("# Add your Discord tokens here\n")
                 f.write("# Format: AccountName:TOKEN\n")
@@ -534,7 +539,6 @@ class AccountManager:
 
         logger.info(f"🚀 Starting {len(self.accounts)} monitors")
         
-        # Send startup notification
         account_names = "\n".join([f"  👤 {acc['name']}" for acc in self.accounts])
         await notifier.send_alert(
             f"🚀 <b>Discord Join Monitor Starting</b>\n"
@@ -546,7 +550,6 @@ class AccountManager:
             "System"
         )
 
-        # Start each account
         for idx, acc in enumerate(self.accounts):
             if idx > 0:
                 stagger = random.uniform(2, 5)
@@ -557,7 +560,6 @@ class AccountManager:
             self.gateways.append(gateway)
             asyncio.create_task(gateway.connect())
 
-        # Keep running
         while self._running:
             await asyncio.sleep(60)
             connected = sum(1 for g in self.gateways if g.ws and not g.ws.closed and g._connected)
@@ -576,10 +578,7 @@ async def main():
     print("■ Discord Join Monitor - Custom WebSocket")
     print("=" * 60)
     
-    # Start Flask server
     threading.Thread(target=run_flask, daemon=True).start()
-    
-    # Create account manager
     manager = AccountManager()
     
     try:
@@ -594,3 +593,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nClosed.")
+      
