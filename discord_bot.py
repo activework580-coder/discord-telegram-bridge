@@ -103,21 +103,16 @@ class DiscordGateway:
             await notifier.send_alert(f"❌ Failed to connect to Discord API", self.label)
             return False
         
-        # Connect with headers
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Origin": "https://discord.com",
-            "Accept-Encoding": "gzip, deflate, br",
-        }
-        
         logger.info(f"{self.label}: 🔌 Connecting to Discord WebSocket...")
         try:
+            # Connect with headers using the correct method
             self.ws = await websockets.connect(
                 gateway_url,
-                extra_headers=headers,
+                user_agent_header="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 compression=None,
                 ping_interval=20,
-                ping_timeout=10
+                ping_timeout=10,
+                close_timeout=10
             )
             logger.info(f"{self.label}: ✅ WebSocket connected")
         except Exception as e:
@@ -465,7 +460,7 @@ class DiscordGateway:
     async def _heartbeat_loop(self):
         """Heartbeat loop"""
         while self._running:
-            await asyncio.sleep(self._heartbeat_interval / 1000 + random.uniform(-0.15, 0.15))
+            await asyncio.sleep(self._heartbeat_interval + random.uniform(-0.15, 0.15))
             if self.ws and self._connected:
                 await self._send_heartbeat()
     
@@ -539,7 +534,7 @@ class AccountManager:
 
         logger.info(f"🚀 Starting {len(self.accounts)} monitors")
         
-         # Send startup notification
+        # Send startup notification
         account_names = "\n".join([f"  👤 {acc['name']}" for acc in self.accounts])
         await notifier.send_alert(
             f"🚀 <b>Discord Join Monitor Starting</b>\n"
@@ -598,4 +593,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nClosed.") 
+        print("\nClosed.")
