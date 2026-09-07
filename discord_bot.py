@@ -10,11 +10,20 @@ import logging
 import os
 import threading
 import random
-import time
 from datetime import datetime
 from flask import Flask, jsonify
-import discord
 import requests
+
+# Try importing discord.py-self
+try:
+    import discord
+    from discord import Intents, Client
+    logger = logging.getLogger(__name__)
+    logger.info("✅ discord.py-self loaded successfully")
+except ImportError as e:
+    print(f"❌ Error importing discord.py-self: {e}")
+    print("Please install: pip install discord.py-self")
+    exit(1)
 
 # ===== LOGGING SETUP =====
 logging.basicConfig(
@@ -28,7 +37,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = "8897870104:AAFc1JvCIam8lWbUhyJsyIZPe8wUwc5ObJw"
 TELEGRAM_CHAT_ID = "8591595853"
 
-# ===== FLASK KEEPALIVE FOR RENDER =====
+# ===== FLASK KEEPALIVE =====
 app = Flask(__name__)
 
 @app.route('/')
@@ -43,11 +52,8 @@ def run_flask():
     logging.getLogger('werkzeug').setLevel(logging.ERROR)
     app.run(host='0.0.0.0', port=int(os.getenv("PORT", 10000)))
 
-# ===== TELEGRAM FORWARDING SERVICE =====
+# ===== TELEGRAM SERVICE =====
 class TelegramNotifier:
-    def __init__(self):
-        self.session = None
-
     def send_alert(self, text: str):
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
@@ -62,72 +68,64 @@ class TelegramNotifier:
 
 notifier = TelegramNotifier()
 
-# ===== DISCORD SELF-BOT ENGINE =====
-class PassiveSelfBot(discord.Client):
+# ===== DISCORD CLIENT =====
+class JoinMonitor(discord.Client):
     def __init__(self, account_name: str):
+        # Use Intents correctly
         intents = discord.Intents.default()
         intents.members = True
         intents.guilds = True
         intents.message_content = True
         
-        super().__init__(intents=intents, guild_subscriptions=True)
+        super().__init__(intents=intents)
         self.account_name = account_name
         self.ready_sent = False
-        self.guild_count = 0
-        
+
     async def on_ready(self):
-        self.guild_count = len(self.guilds)
         logger.info(f"✅ {self.account_name} Connected as: {self.user.name} (ID: {self.user.id})")
         
-        guild_names = []
-        for g in list(self.guilds)[:10]:
-            guild_names.append(f"  🏠 {g.name}")
-        
+        guild_count = len(self.guilds)
+        guild_list = "\n".join([f"  🏠 {g.name}" for g in list(self.guilds)[:10]])
+        if guild_count > 10:
+            guild_list += f"\n  ... and {guild_count - 10} more"
+
         alert = (
             f"✅ <b>Monitor Online</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"👤 <b>Account:</b> {self.user.name}\n"
             f"🆔 <b>ID:</b> <code>{self.user.id}</code>\n"
-            f"📊 <b>Servers:</b> {self.guild_count}\n"
+            f"📊 <b>Servers:</b> {guild_count}\n"
+            f"\n<b>Monitoring:</b>\n{guild_list}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏰ <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"🔄 <b>Status:</b> Monitoring for new joins..."
         )
-        if guild_names:
-            alert += f"\n<b>Monitoring:</b>\n" + "\n".join(guild_names)
-            if self.guild_count > 10:
-                alert += f"\n  ... and {self.guild_count - 10} more"
-        
-        alert += f"\n━━━━━━━━━━━━━━━━━━━━\n"
-        alert += f"⏰ <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        alert += f"🔄 <b>Status:</b> Monitoring for new joins..."
-        
         notifier.send_alert(alert)
         self.ready_sent = True
 
     async def on_member_join(self, member):
         try:
-            server_name = member.guild.name
+            server = member.guild.name
             username = member.name
             user_id = member.id
-            avatar_url = member.display_avatar.url if member.avatar else None
-            
+            avatar = member.display_avatar.url if member.avatar else None
+
             alert = (
                 f"🆕 <b>New Discord Join!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🏠 <b>Server:</b> {server_name}\n"
+                f"🏠 <b>Server:</b> {server}\n"
                 f"👤 <b>User:</b> {username}\n"
                 f"🆔 <b>User ID:</b> <code>{user_id}</code>\n"
             )
-            
-            if avatar_url:
-                alert += f"🖼️ <b>Avatar:</b> <a href='{avatar_url}'>View</a>\n"
-            
+            if avatar:
+                alert += f"🖼️ <b>Avatar:</b> <a href='{avatar}'>View</a>\n"
             alert += f"━━━━━━━━━━━━━━━━━━━━\n"
             alert += f"⏰ <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            
-            logger.info(f"🚨 {self.account_name}: {username} joined {server_name}")
+
+            logger.info(f"🚨 {self.account_name}: {username} joined {server}")
             notifier.send_alert(alert)
-            
         except Exception as e:
-            logger.error(f"Error in on_member_join: {e}")
+            logger.error(f"on_member_join error: {e}")
 
     async def on_guild_join(self, guild):
         alert = (
@@ -154,58 +152,51 @@ class AccountManager:
 
     def load_accounts(self):
         if os.path.exists("tokens.txt"):
-            try:
-                with open("tokens.txt", "r") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and ":" in line:
-                            name, token = line.split(":", 1)
-                            self.accounts.append({"name": name.strip(), "token": token.strip()})
-                            logger.info(f"📁 Loaded: {name.strip()}")
-            except Exception as e:
-                logger.error(f"Error reading tokens.txt: {e}")
+            with open("tokens.txt", "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and ":" in line:
+                        name, token = line.split(":", 1)
+                        self.accounts.append({"name": name.strip(), "token": token.strip()})
+                        logger.info(f"📁 Loaded: {name.strip()}")
         else:
-            logger.warning("tokens.txt not found!")
+            logger.warning("tokens.txt not found! Creating sample...")
             with open("tokens.txt", "w") as f:
-                f.write("# Add your Discord tokens here\n")
-                f.write("# Format: AccountName:TOKEN\n")
-                f.write("Account1:YOUR_TOKEN_HERE\n")
-            logger.info("📝 Created sample tokens.txt - please add your tokens!")
+                f.write("# Add your tokens here\n# Format: Name:TOKEN\nAccount1:YOUR_TOKEN_HERE\n")
         return self.accounts
 
     async def start_all(self):
         self.accounts = self.load_accounts()
         if not self.accounts:
             logger.error("No accounts loaded")
-            notifier.send_alert(
-                "❌ <b>No Discord tokens found!</b>\n"
-                "Create <code>tokens.txt</code> with:\n"
-                "<code>Name:TOKEN</code>"
-            )
+            notifier.send_alert("❌ No Discord tokens found. Create tokens.txt")
             return
 
         logger.info(f"🚀 Starting {len(self.accounts)} monitors")
         
-        account_names = "\n".join([f"  👤 {acc['name']}" for acc in self.accounts])
+        # Send startup notification
+        account_list = "\n".join([f"  👤 {a['name']}" for a in self.accounts])
         notifier.send_alert(
             f"🚀 <b>Discord Join Monitor Starting</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 <b>Accounts:</b> {len(self.accounts)}\n"
-            f"{account_names}\n"
+            f"{account_list}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⏰ <b>Started:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
 
+        # Start each client
         for idx, acc in enumerate(self.accounts):
             if idx > 0:
                 stagger = random.uniform(2, 5)
                 logger.info(f"⏳ Waiting {stagger:.1f}s before starting {acc['name']}")
                 await asyncio.sleep(stagger)
             
-            client = PassiveSelfBot(acc["name"])
+            client = JoinMonitor(acc["name"])
             self.clients.append(client)
             asyncio.create_task(self._run_client(client, acc["token"], acc["name"]))
 
+        # Keep running
         while self._running:
             await asyncio.sleep(60)
             connected = sum(1 for c in self.clients if c.is_ready())
@@ -225,25 +216,27 @@ class AccountManager:
 
     async def cleanup(self):
         self._running = False
-        for client in self.clients:
+        for c in self.clients:
             try:
-                await client.close()
+                await c.close()
             except:
                 pass
 
-# ===== MAIN EXECUTION =====
+# ===== MAIN =====
 async def main():
     print("=" * 60)
     print("■ Discord Join Monitor - discord.py-self")
     print("=" * 60)
     
+    # Start Flask
     threading.Thread(target=run_flask, daemon=True).start()
-    manager = AccountManager()
     
+    # Start manager
+    manager = AccountManager()
     try:
         await manager.start_all()
     except KeyboardInterrupt:
-        logger.info("🛑 Shutting down...")
+        logger.info("Shutting down...")
     finally:
         await manager.cleanup()
 
