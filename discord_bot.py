@@ -14,6 +14,7 @@ import base64
 import hashlib
 import logging
 import threading
+import re
 from datetime import datetime
 from flask import Flask, jsonify
 from curl_cffi import requests as curl_requests
@@ -181,27 +182,100 @@ class DiscordGateway:
             else:
                 await self._reconnect()
 
+    def _clean_json_message(self, message: str) -> str:
+        """Attempt to clean malformed JSON messages"""
+        if not message:
+            return message
+            
+        # Remove b'...' wrapper if present
+        if message.startswith("b'") and message.endswith("'"):
+            message = message[2:-1]
+        elif message.startswith('b"') and message.endswith('"'):
+            message = message[2:-1]
+        
+        # Unescape quotes
+        message = message.replace('\\"', '"')
+        
+        # Fix common JSON issues
+        # 1. Fix trailing commas before closing braces/brackets
+        message = re.sub(r',\s*}', '}', message)
+        message = re.sub(r',\s*\]', ']', message)
+        
+        # 2. Fix missing commas between objects in arrays
+        message = re.sub(r'}\s*{', '},{', message)
+        
+        # 3. Fix single quotes to double quotes (but careful with strings)
+        # Only replace single quotes that are not inside strings
+        def replace_single_quotes(match):
+            return '"' + match.group(1) + '"'
+        # This is a simplistic approach - use JSON5 or ast.literal_eval for better handling
+        
+        # 4. Remove control characters
+        message = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', message)
+        
+        return message.strip()
+
+    def _safe_json_loads(self, message: str):
+        """Safely load JSON with multiple fallback methods"""
+        # First try: normal JSON parse
+        try:
+            return json.loads(message)
+        except json.JSONDecodeError:
+            pass
+        
+        # Second try: clean and try again
+        try:
+            cleaned = self._clean_json_message(message)
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            pass
+        
+        # Third try: use ast.literal_eval for Python-like dicts
+        try:
+            import ast
+            # Convert single quotes to double quotes for JSON
+            if "'" in message and '"' not in message:
+                # Try to parse as Python dict with single quotes
+                data = ast.literal_eval(message)
+                if isinstance(data, dict):
+                    return data
+        except:
+            pass
+        
+        # Fourth try: Extract JSON using regex (find anything that looks like JSON)
+        try:
+            # Find JSON object or array pattern
+            json_pattern = r'\{[^{}]*\}|\[[^\[\]]*\]'
+            matches = re.findall(json_pattern, message)
+            for match in matches:
+                try:
+                    return json.loads(match)
+                except:
+                    continue
+        except:
+            pass
+        
+        # If all fails, raise the original error
+        raise json.JSONDecodeError(f"Unable to parse JSON: {message[:200]}", message, 0)
+
     async def _extract_message(self, raw):
         """Extract and clean message from various WebSocket response formats"""
-        message = None
-        
         try:
-            # Handle different raw message types
             if raw is None:
                 return None
                 
-            # If it's a tuple, get the first element
+            # Handle tuple
             if isinstance(raw, tuple):
                 if len(raw) > 0:
                     raw = raw[0]
                 else:
                     return None
             
-            # If it has a data attribute (WebSocket message object)
+            # Handle WebSocket message object
             if hasattr(raw, "data"):
                 raw = raw.data
             
-            # Convert bytes to string
+            # Convert to string
             if isinstance(raw, bytes):
                 message = raw.decode('utf-8', errors='ignore')
             elif isinstance(raw, str):
@@ -209,19 +283,7 @@ class DiscordGateway:
             else:
                 message = str(raw)
             
-            # Clean up the message
-            if message:
-                # Remove b'...' wrapping if present
-                if message.startswith("b'") and message.endswith("'"):
-                    message = message[2:-1]
-                elif message.startswith('b"') and message.endswith('"'):
-                    message = message[2:-1]
-                
-                # Unescape quotes
-                message = message.replace('\\"', '"')
-                message = message.strip()
-            
-            return message
+            return message.strip() if message else None
             
         except Exception as e:
             logger.error(f"{self.label}: Error extracting message: {e}")
@@ -232,26 +294,32 @@ class DiscordGateway:
             try:
                 raw = await asyncio.wait_for(self.ws.recv(), timeout=45)
                 
-                # Extract and clean the message
                 message = await self._extract_message(raw)
                 
                 if not message:
-                    logger.debug(f"{self.label}: Received empty or invalid message, skipping...")
                     continue
 
-                # Try to parse JSON
+                # Log raw message for debugging (first 200 chars)
+                logger.debug(f"{self.label} RAW: {message[:200]}...")
+
+                # Try to parse JSON with robust handling
                 try:
-                    data = json.loads(message)
+                    data = self._safe_json_loads(message)
                 except json.JSONDecodeError as e:
                     # Check if it's a simple numeric opcode
                     if message.strip().isdigit():
                         op = int(message.strip())
                         if op == 11:
-                            logger.debug(f"{self.label}: Received heartbeat ACK (op 11)")
+                            logger.debug(f"{self.label}: Heartbeat ACK")
                             continue
                     
                     logger.warning(f"{self.label}: Failed to parse JSON: {e}")
-                    logger.debug(f"{self.label}: Raw message: {message[:500]}")
+                    logger.debug(f"{self.label}: Message: {message[:500]}")
+                    continue
+
+                # Ensure data is a dict
+                if not isinstance(data, dict):
+                    logger.warning(f"{self.label}: Unexpected data type: {type(data)}")
                     continue
 
                 # Process the message
@@ -265,13 +333,13 @@ class DiscordGateway:
                 elif op == 1:
                     await self._send_heartbeat()
                 elif op == 7:
-                    logger.info(f"{self.label}: Server synchronization reset requested.")
+                    logger.info(f"{self.label}: Server reset requested.")
                     await self._reconnect()
                     return
                 elif op == 9:
                     if d is False:
                         logger.error(f"{self.label}: Handshake rejected.")
-                        await self.telegram.send(f"❌ Authorization tracking dropped", self.label)
+                        await self.telegram.send(f"❌ Authorization dropped", self.label)
                         self._invalid_token = True
                         self._running = False
                         return
@@ -282,23 +350,23 @@ class DiscordGateway:
                     await self._send_identity()
                     self._connected = True
                     self.is_connected = True
-                    logger.info(f"{self.label}: Handshake authorization validated. Heartbeat: {self._heartbeat_interval}s")
+                    logger.info(f"{self.label}: Authorized. Heartbeat: {self._heartbeat_interval}s")
                 elif op == 11:
                     logger.debug(f"{self.label}: Heartbeat ACK")
                 else:
-                    logger.debug(f"{self.label}: Unhandled opcode {op}")
+                    logger.debug(f"{self.label}: Opcode {op}")
                     
             except asyncio.TimeoutError:
-                logger.warning(f"{self.label}: Receive timeout, sending heartbeat...")
+                logger.warning(f"{self.label}: Receive timeout")
                 await self._send_heartbeat()
             except Exception as e:
                 error_str = str(e).lower()
                 if "closed" in error_str or "connection" in error_str:
-                    logger.warning(f"{self.label}: Connection closed, reconnecting...")
+                    logger.warning(f"{self.label}: Connection closed")
                     await self._reconnect()
                     return
                 else:
-                    logger.error(f"{self.label}: Exception in receive loop: {e}")
+                    logger.error(f"{self.label}: Receive error: {e}")
                     await asyncio.sleep(1)
 
     async def _heartbeat_loop(self):
@@ -308,17 +376,16 @@ class DiscordGateway:
                 if self._connected and self.ws:
                     await self._send_heartbeat()
             except Exception as e:
-                logger.error(f"{self.label}: Heartbeat loop error: {e}")
+                logger.error(f"{self.label}: Heartbeat error: {e}")
                 await asyncio.sleep(5)
 
     async def _send_heartbeat(self):
         if self.ws:
             try:
-                heartbeat_payload = json.dumps({"op": 1, "d": self._seq})
-                await self.ws.send(heartbeat_payload)
-                logger.debug(f"{self.label}: Heartbeat sent (seq: {self._seq})")
+                await self.ws.send(json.dumps({"op": 1, "d": self._seq}))
+                logger.debug(f"{self.label}: Heartbeat sent")
             except Exception as e:
-                logger.error(f"{self.label}: Heartbeat send failed: {e}")
+                logger.error(f"{self.label}: Heartbeat failed: {e}")
                 self._connected = False
                 self.is_connected = False
 
@@ -350,7 +417,7 @@ class DiscordGateway:
             await self.ws.send(json.dumps(identity))
             logger.info(f"{self.label}: Identity sent")
         except Exception as e:
-            logger.error(f"{self.label}: Failed to send identity: {e}")
+            logger.error(f"{self.label}: Identity failed: {e}")
 
     async def _subscribe_to_guild(self, guild_id: str):
         lazy_subscription = {
@@ -367,9 +434,9 @@ class DiscordGateway:
         try:
             await self.ws.send(json.dumps(lazy_subscription))
             self._subscribed_guilds.add(guild_id)
-            logger.info(f"{self.label}: Subscribed to guild {guild_id}")
+            logger.info(f"{self.label}: Subscribed to {guild_id}")
         except Exception as e:
-            logger.error(f"{self.label}: Failed to subscribe to guild {guild_id}: {e}")
+            logger.error(f"{self.label}: Subscribe failed: {e}")
 
     async def _handle_event(self, event_type: str, data: dict):
         if event_type == "READY":
@@ -382,13 +449,13 @@ class DiscordGateway:
             username = user.get('username', 'Unknown')
             logger.info(f"{self.label}: Connected as {username}")
             await self.telegram.send(
-                f"✅ <b>Online</b> | Connected as <code>{username}</code>",
+                f"✅ <b>Online</b> | <code>{username}</code>",
                 self.label
             )
             for guild in guilds:
                 guild_id = guild.get('id')
                 if guild_id:
-                    await asyncio.sleep(random.uniform(0.5, 1.2))
+                    await asyncio.sleep(random.uniform(0.3, 0.8))
                     await self._subscribe_to_guild(guild_id)
 
         elif event_type == 'GUILD_CREATE':
@@ -396,7 +463,7 @@ class DiscordGateway:
             g_name = data.get('name')
             if g_id and g_name:
                 self._guilds[g_id] = g_name
-                logger.info(f"{self.label} Cached guild: {g_name} ({g_id})")
+                logger.info(f"{self.label} Cached: {g_name}")
 
         elif event_type == 'GUILD_MEMBER_ADD':
             guild_id = data.get('guild_id')
@@ -415,7 +482,7 @@ class DiscordGateway:
                 f"⏰ <b>Time:</b> <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
             )
             
-            logger.info(f"{self.label}: New join: {username} -> {guild_name}")
+            logger.info(f"{self.label}: {username} joined {guild_name}")
             await self.telegram.send(alert, self.label)
 
     async def _reconnect(self):
