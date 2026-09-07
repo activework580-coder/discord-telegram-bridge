@@ -58,7 +58,9 @@ class TelegramNotifier:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
         try:
-            response = requests.post(url, json=payload, timeout=10)
+            # Use curl_cffi for better compatibility
+            from curl_cffi import requests as curl_requests
+            response = curl_requests.post(url, json=payload, timeout=10, impersonate="chrome")
             if response.status_code == 200:
                 logger.info("📨 Alert sent to Telegram")
             else:
@@ -85,6 +87,7 @@ class DiscordGateway:
         self._username = None
         self._reconnect_attempt = 0
         self._subscribed_guilds = set()
+        self._gateway_url = None
         
     async def connect(self):
         """Connect to Discord WebSocket"""
@@ -93,8 +96,12 @@ class DiscordGateway:
             await notifier.send_alert(f"❌ Invalid token for {self.label}", self.label)
             return False
             
-        # Get gateway URL
-        gateway_url = self._get_gateway_url()
+        # Get gateway URL with retries
+        gateway_url = await self._get_gateway_url_with_retry()
+        if not gateway_url:
+            logger.error(f"{self.label}: Failed to get gateway URL")
+            await notifier.send_alert(f"❌ Failed to connect to Discord API", self.label)
+            return False
         
         # Connect with headers
         headers = {
@@ -108,11 +115,14 @@ class DiscordGateway:
             self.ws = await websockets.connect(
                 gateway_url,
                 extra_headers=headers,
-                compression=None
+                compression=None,
+                ping_interval=20,
+                ping_timeout=10
             )
             logger.info(f"{self.label}: ✅ WebSocket connected")
         except Exception as e:
             logger.error(f"{self.label}: WebSocket connection failed: {e}")
+            await notifier.send_alert(f"❌ WebSocket connection failed: {str(e)[:100]}", self.label)
             return False
         
         # Start heartbeat loop
@@ -122,20 +132,46 @@ class DiscordGateway:
         await self._receive_loop()
         return True
     
-    def _get_gateway_url(self):
-        """Get the WebSocket gateway URL"""
-        response = requests.get("https://discord.com/api/v9/gateway")
-        if response.status_code == 200:
-            url = response.json().get("url")
-            logger.info(f"{self.label}: 🌐 Gateway: {url}")
-            return f"{url}?v=9&encoding=json"
-        raise Exception("Failed to get gateway URL")
+    async def _get_gateway_url_with_retry(self, max_retries=3):
+        """Get gateway URL with retries and fallback URLs"""
+        # Try multiple gateway URLs
+        gateway_options = [
+            "https://discord.com/api/v9/gateway",
+            "https://discord.com/api/v10/gateway",
+            "https://gateway.discord.gg/"
+        ]
+        
+        for attempt in range(max_retries):
+            for url in gateway_options:
+                try:
+                    logger.info(f"{self.label}: Attempting to get gateway from {url}")
+                    response = requests.get(url, timeout=10)
+                    if response.status_code == 200:
+                        data = response.json()
+                        gateway_url = data.get("url")
+                        if gateway_url:
+                            logger.info(f"{self.label}: 🌐 Gateway: {gateway_url}")
+                            return f"{gateway_url}?v=9&encoding=json"
+                except Exception as e:
+                    logger.warning(f"{self.label}: Gateway attempt failed: {e}")
+                    continue
+            
+            # Wait before retry
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                logger.info(f"{self.label}: Retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+        
+        # Fallback: Use known gateway
+        fallback = "wss://gateway.discord.gg/?v=9&encoding=json"
+        logger.warning(f"{self.label}: Using fallback gateway: {fallback}")
+        return fallback
     
     async def _receive_loop(self):
         """Main receive loop"""
         while self._running:
             try:
-                message = await self.ws.recv()
+                message = await asyncio.wait_for(self.ws.recv(), timeout=60)
                 
                 # Handle different message types
                 if isinstance(message, bytes):
@@ -163,6 +199,9 @@ class DiscordGateway:
                 # Process the message
                 await self._process_message(data)
                 
+            except asyncio.TimeoutError:
+                logger.warning(f"{self.label}: Receive timeout, sending heartbeat...")
+                await self._send_heartbeat()
             except websockets.exceptions.ConnectionClosed as e:
                 logger.warning(f"{self.label}: Connection closed: {e}")
                 await self._reconnect()
@@ -203,6 +242,7 @@ class DiscordGateway:
         elif op == 10:  # Hello
             self._heartbeat_interval = d.get('heartbeat_interval', 41250) / 1000.0
             logger.info(f"{self.label}: 💓 Heartbeat interval: {self._heartbeat_interval}s")
+            self._connected = True
             await self._send_identity()
             
         elif op == 11:  # Heartbeat ACK
@@ -309,11 +349,9 @@ class DiscordGateway:
             await notifier.send_alert(alert, self.label)
             
         elif event_type == "GUILD_MEMBER_UPDATE":
-            # Optional: Track user updates
             pass
             
         elif event_type == "PRESENCE_UPDATE":
-            # Optional: Track presence changes
             pass
             
         # Log all events for debugging
@@ -427,7 +465,7 @@ class DiscordGateway:
     async def _heartbeat_loop(self):
         """Heartbeat loop"""
         while self._running:
-            await asyncio.sleep(self._heartbeat_interval + random.uniform(-0.15, 0.15))
+            await asyncio.sleep(self._heartbeat_interval / 1000 + random.uniform(-0.15, 0.15))
             if self.ws and self._connected:
                 await self._send_heartbeat()
     
@@ -436,6 +474,7 @@ class DiscordGateway:
         self._reconnect_attempt += 1
         delay = min(30, 2 ** self._reconnect_attempt)
         logger.info(f"{self.label}: 🔄 Reconnecting in {delay}s...")
+        self._connected = False
         await self.close()
         await asyncio.sleep(delay)
         await self.connect()
@@ -445,6 +484,10 @@ class DiscordGateway:
         self._running = False
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except:
+                pass
         if self.ws:
             try:
                 await self.ws.close()
@@ -496,7 +539,7 @@ class AccountManager:
 
         logger.info(f"🚀 Starting {len(self.accounts)} monitors")
         
-        # Send startup notification
+         # Send startup notification
         account_names = "\n".join([f"  👤 {acc['name']}" for acc in self.accounts])
         await notifier.send_alert(
             f"🚀 <b>Discord Join Monitor Starting</b>\n"
@@ -522,7 +565,7 @@ class AccountManager:
         # Keep running
         while self._running:
             await asyncio.sleep(60)
-            connected = sum(1 for g in self.gateways if g.ws and not g.ws.closed)
+            connected = sum(1 for g in self.gateways if g.ws and not g.ws.closed and g._connected)
             total = len(self.gateways)
             logger.info(f"📊 Status: {connected}/{total} connected")
 
@@ -555,4 +598,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nClosed.")
+        print("\nClosed.") 
