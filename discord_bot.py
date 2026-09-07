@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # ====== HARDCODED CREDENTIALS ======
 TELEGRAM_BOT_TOKEN = "8897870104:AAFc1JvC1am81WbUhyJsyI2Pe8wUwc50bJw"
 TELEGRAM_CHAT_ID = "8591595853"
-PROXY_URL = None  # Set your proxy here if needed: "http://user:pass@host:port"
+PROXY_URL = None
 HEARTBEAT_JITTER = 0.15
 
 # ====== FLASK WEB SERVER ======
@@ -188,6 +188,7 @@ class DiscordGateway:
                 if raw is None:
                     continue
                 
+                # Handle different raw message types
                 if isinstance(raw, tuple):
                     binary_payload = raw if len(raw) > 0 else b""
                 elif hasattr(raw, "data"):
@@ -195,15 +196,31 @@ class DiscordGateway:
                 else:
                     binary_payload = raw
 
+                # Convert to string
                 if isinstance(binary_payload, bytes):
-                    message = binary_payload.decode('utf-8', errors='ignore')
+                    message = binary_payload.decode('utf-8', errors='ignore').strip()
                 else:
-                    message = str(binary_payload)
+                    message = str(binary_payload).strip()
 
-                if not message.strip():
+                # Skip empty messages
+                if not message:
+                    logger.debug(f"{self.label}: Received empty message, skipping...")
                     continue
 
-                data = json.loads(message)
+                # Try to parse JSON
+                try:
+                    data = json.loads(message)
+                except json.JSONDecodeError as e:
+                    logger.warning(f"{self.label}: Failed to parse JSON: {e} | Message preview: {message[:100]}")
+                    # If it's an opcode 11 heartbeat ACK, it might be just "11"
+                    if message.isdigit():
+                        op = int(message)
+                        if op == 11:
+                            logger.debug(f"{self.label}: Received heartbeat ACK (op 11)")
+                            continue
+                    continue
+
+                # Process the message
                 op = data.get('op')
                 t = data.get('t')
                 d = data.get('d', {})
@@ -233,31 +250,46 @@ class DiscordGateway:
                     self.is_connected = True
                     logger.info(f"{self.label}: Handshake authorization validated.")
                 elif op == 11:
+                    # Heartbeat ACK - just log at debug level
+                    logger.debug(f"{self.label}: Heartbeat ACK received")
                     pass
+                else:
+                    logger.debug(f"{self.label}: Unhandled opcode {op}")
+                    
             except asyncio.TimeoutError:
+                logger.warning(f"{self.label}: Receive timeout, sending heartbeat...")
                 await self._send_heartbeat()
             except Exception as e:
-                if "closed" in str(e).lower():
-                    logger.warning(f"{self.label}: Link termination observed.")
+                error_str = str(e).lower()
+                if "closed" in error_str or "connection" in error_str:
+                    logger.warning(f"{self.label}: Connection closed, reconnecting...")
                     await self._reconnect()
                     return
                 else:
-                    logger.error(f"{self.label}: Exception captured in network framework reader: {e}")
-                    await self._reconnect()
-                    return
+                    logger.error(f"{self.label}: Exception in receive loop: {e}")
+                    await asyncio.sleep(1)  # Small delay before retry
+                    # Don't reconnect immediately for non-critical errors
 
     async def _heartbeat_loop(self):
         while self._running:
-            await asyncio.sleep(self._heartbeat_interval + random.uniform(-HEARTBEAT_JITTER, HEARTBEAT_JITTER))
-            if self._connected:
-                await self._send_heartbeat()
+            try:
+                await asyncio.sleep(self._heartbeat_interval + random.uniform(-HEARTBEAT_JITTER, HEARTBEAT_JITTER))
+                if self._connected and self.ws:
+                    await self._send_heartbeat()
+            except Exception as e:
+                logger.error(f"{self.label}: Heartbeat loop error: {e}")
+                await asyncio.sleep(5)
 
     async def _send_heartbeat(self):
         if self.ws:
             try:
-                await self.ws.send(json.dumps({"op": 1, "d": self._seq}))
+                heartbeat_payload = json.dumps({"op": 1, "d": self._seq})
+                await self.ws.send(heartbeat_payload)
+                logger.debug(f"{self.label}: Heartbeat sent (seq: {self._seq})")
             except Exception as e:
                 logger.error(f"{self.label}: Heartbeat send failed: {e}")
+                self._connected = False
+                self.is_connected = False
 
     async def _send_identity(self):
         fingerprint = generate_fingerprint(self.account_index, self.token)
@@ -283,7 +315,11 @@ class DiscordGateway:
                 }
             }
         }
-        await self.ws.send(json.dumps(identity))
+        try:
+            await self.ws.send(json.dumps(identity))
+            logger.info(f"{self.label}: Identity sent")
+        except Exception as e:
+            logger.error(f"{self.label}: Failed to send identity: {e}")
 
     async def _subscribe_to_guild(self, guild_id: str):
         lazy_subscription = {
@@ -297,9 +333,12 @@ class DiscordGateway:
                 "channels": {}
             }
         }
-        await self.ws.send(json.dumps(lazy_subscription))
-        self._subscribed_guilds.add(guild_id)
-        logger.info(f"{self.label}: Opcode 14 Lazy-Guild Subscription sent for server ID {guild_id}")
+        try:
+            await self.ws.send(json.dumps(lazy_subscription))
+            self._subscribed_guilds.add(guild_id)
+            logger.info(f"{self.label}: Opcode 14 Lazy-Guild Subscription sent for server ID {guild_id}")
+        except Exception as e:
+            logger.error(f"{self.label}: Failed to subscribe to guild {guild_id}: {e}")
 
     async def _handle_event(self, event_type: str, data: dict):
         if event_type == "READY":
@@ -356,22 +395,32 @@ class DiscordGateway:
 
     async def _reconnect(self):
         logger.info(f"{self.label}: Attempting reconnection...")
+        self._connected = False
+        self.is_connected = False
         await self.close()
         self._reconnect_attempt += 1
         delay = min(30, 2 ** self._reconnect_attempt)
+        logger.info(f"{self.label}: Reconnecting in {delay} seconds...")
         await asyncio.sleep(delay)
 
     async def close(self):
         self._running = False
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except:
+                pass
         if self.ws:
             try:
                 await self.ws.close()
             except Exception:
                 pass
         if self._session:
-            await self._session.close()
+            try:
+                await self._session.close()
+            except Exception:
+                pass
 
 # ====== ACCOUNT MANAGER ======
 class AccountManager:
@@ -383,13 +432,16 @@ class AccountManager:
     def load_accounts(self):
         """Load Discord tokens from tokens.txt file"""
         if os.path.exists("tokens.txt"):
-            with open("tokens.txt", "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if line and ":" in line:
-                        name, token = line.split(":", 1)
-                        self.accounts.append({"name": name.strip(), "token": token.strip()})
-                        logger.info(f"Loaded account: {name.strip()}")
+            try:
+                with open("tokens.txt", "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and ":" in line:
+                            name, token = line.split(":", 1)
+                            self.accounts.append({"name": name.strip(), "token": token.strip()})
+                            logger.info(f"Loaded account: {name.strip()}")
+            except Exception as e:
+                logger.error(f"Error reading tokens.txt: {e}")
         else:
             logger.warning("tokens.txt file not found!")
             
