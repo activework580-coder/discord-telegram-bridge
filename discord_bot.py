@@ -61,14 +61,14 @@ class TelegramService:
 
     async def send(self, text: str, account_label: str = None):
         if account_label:
-            text = f'<b>{account_label}</b>: {text}'
+            text = f'<b>{account_label}</b>\n{text}'
         now = time.time()
         if now - self._last_sent < self._min_interval:
             await asyncio.sleep(self._min_interval - (now - self._last_sent))
         self._last_sent = time.time()
         try:
             session = await self._get_session()
-            await session.post(
+            response = await session.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                 json={
                     "chat_id": TELEGRAM_CHAT_ID, 
@@ -76,7 +76,7 @@ class TelegramService:
                     "parse_mode": "HTML"
                 }
             )
-            logger.info(f"Telegram alert dispatched successfully.")
+            logger.info(f"Telegram message sent successfully")
             return True
         except Exception as e:
             logger.error(f"Telegram error: {e}")
@@ -135,6 +135,7 @@ class DiscordGateway:
         self._invalid_token = False
         self._ready_received = False
         self._subscribed_guilds = set()
+        self._guild_list_reported = False  # Track if we've reported the guild list
 
     async def run(self):
         while self._running and not self._invalid_token:
@@ -197,20 +198,9 @@ class DiscordGateway:
         message = message.replace('\\"', '"')
         
         # Fix common JSON issues
-        # 1. Fix trailing commas before closing braces/brackets
         message = re.sub(r',\s*}', '}', message)
         message = re.sub(r',\s*\]', ']', message)
-        
-        # 2. Fix missing commas between objects in arrays
         message = re.sub(r'}\s*{', '},{', message)
-        
-        # 3. Fix single quotes to double quotes (but careful with strings)
-        # Only replace single quotes that are not inside strings
-        def replace_single_quotes(match):
-            return '"' + match.group(1) + '"'
-        # This is a simplistic approach - use JSON5 or ast.literal_eval for better handling
-        
-        # 4. Remove control characters
         message = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', message)
         
         return message.strip()
@@ -233,18 +223,15 @@ class DiscordGateway:
         # Third try: use ast.literal_eval for Python-like dicts
         try:
             import ast
-            # Convert single quotes to double quotes for JSON
             if "'" in message and '"' not in message:
-                # Try to parse as Python dict with single quotes
                 data = ast.literal_eval(message)
                 if isinstance(data, dict):
                     return data
         except:
             pass
         
-        # Fourth try: Extract JSON using regex (find anything that looks like JSON)
+        # Fourth try: Extract JSON using regex
         try:
-            # Find JSON object or array pattern
             json_pattern = r'\{[^{}]*\}|\[[^\[\]]*\]'
             matches = re.findall(json_pattern, message)
             for match in matches:
@@ -264,18 +251,15 @@ class DiscordGateway:
             if raw is None:
                 return None
                 
-            # Handle tuple
             if isinstance(raw, tuple):
                 if len(raw) > 0:
                     raw = raw[0]
                 else:
                     return None
             
-            # Handle WebSocket message object
             if hasattr(raw, "data"):
                 raw = raw.data
             
-            # Convert to string
             if isinstance(raw, bytes):
                 message = raw.decode('utf-8', errors='ignore')
             elif isinstance(raw, str):
@@ -299,14 +283,11 @@ class DiscordGateway:
                 if not message:
                     continue
 
-                # Log raw message for debugging (first 200 chars)
                 logger.debug(f"{self.label} RAW: {message[:200]}...")
 
-                # Try to parse JSON with robust handling
                 try:
                     data = self._safe_json_loads(message)
                 except json.JSONDecodeError as e:
-                    # Check if it's a simple numeric opcode
                     if message.strip().isdigit():
                         op = int(message.strip())
                         if op == 11:
@@ -317,12 +298,10 @@ class DiscordGateway:
                     logger.debug(f"{self.label}: Message: {message[:500]}")
                     continue
 
-                # Ensure data is a dict
                 if not isinstance(data, dict):
                     logger.warning(f"{self.label}: Unexpected data type: {type(data)}")
                     continue
 
-                # Process the message
                 op = data.get('op')
                 t = data.get('t')
                 d = data.get('d', {})
@@ -445,18 +424,56 @@ class DiscordGateway:
             for g in guilds:
                 if 'id' in g:
                     self._guilds[g['id']] = g.get('name', 'Unknown')
+            
             user = data.get('user', {})
             username = user.get('username', 'Unknown')
-            logger.info(f"{self.label}: Connected as {username}")
-            await self.telegram.send(
-                f"✅ <b>Online</b> | <code>{username}</code>",
-                self.label
+            user_id = user.get('id', 'Unknown')
+            
+            logger.info(f"{self.label}: Connected as {username} ({user_id})")
+            
+            # Send detailed Telegram notification about connection
+            total_servers = len(guilds)
+            server_names = []
+            for g in guilds[:5]:  # Show first 5 servers
+                name = g.get('name', 'Unknown Server')
+                server_names.append(f"  🏠 {name}")
+            
+            # Create the message
+            message = (
+                f"✅ <b>Connected to Discord</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 <b>Account:</b> {username}\n"
+                f"🆔 <b>User ID:</b> <code>{user_id}</code>\n"
+                f"📊 <b>Monitoring:</b> {total_servers} servers\n"
             )
+            
+            if server_names:
+                message += f"\n<b>Servers being monitored:</b>\n"
+                message += "\n".join(server_names)
+                if total_servers > 5:
+                    message += f"\n  ... and {total_servers - 5} more"
+            
+            message += f"\n━━━━━━━━━━━━━━━━━━━━\n"
+            message += f"⏰ <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            message += f"🔄 <b>Status:</b> Monitoring for new joins..."
+            
+            # Send the Telegram notification
+            await self.telegram.send(message, self.label)
+            
+            # Subscribe to all guilds
             for guild in guilds:
                 guild_id = guild.get('id')
                 if guild_id:
                     await asyncio.sleep(random.uniform(0.3, 0.8))
                     await self._subscribe_to_guild(guild_id)
+            
+            # Send a second notification confirming subscriptions are complete
+            await asyncio.sleep(2)
+            await self.telegram.send(
+                f"🔍 <b>Now monitoring all {total_servers} servers</b>\n"
+                f"✅ Subscriptions active - ready for join notifications!",
+                self.label
+            )
 
         elif event_type == 'GUILD_CREATE':
             g_id = data.get('id')
@@ -471,18 +488,25 @@ class DiscordGateway:
             guild_name = self._guilds.get(guild_id, f'Server {guild_id}')
             username = user.get('username', 'Unknown')
             user_id = user.get('id', 'Unknown')
+            avatar_hash = user.get('avatar', '')
             
+            # Build the join notification
             alert = (
                 f"🆕 <b>New Discord Join!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🏠 <b>Server:</b> <code>{guild_name}</code>\n"
-                f"👤 <b>User:</b> <code>{username}</code>\n"
-                f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"⏰ <b>Time:</b> <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+                f"🏠 <b>Server:</b> {guild_name}\n"
+                f"👤 <b>User:</b> {username}\n"
+                f"🆔 <b>User ID:</b> <code>{user_id}</code>\n"
             )
             
-            logger.info(f"{self.label}: {username} joined {guild_name}")
+            if avatar_hash:
+                avatar_url = f"https://cdn.discordapp.com/avatars/{user_id}/{avatar_hash}.png"
+                alert += f"🖼️ <b>Avatar:</b> <a href='{avatar_url}'>View Avatar</a>\n"
+            
+            alert += f"━━━━━━━━━━━━━━━━━━━━\n"
+            alert += f"⏰ <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            
+            logger.info(f"{self.label}: 🚨 {username} joined {guild_name}")
             await self.telegram.send(alert, self.label)
 
     async def _reconnect(self):
@@ -520,6 +544,7 @@ class AccountManager:
         self.accounts = []
         self.gateways = []
         self.telegram = TelegramService()
+        self.startup_message_sent = False
 
     def load_accounts(self):
         if os.path.exists("tokens.txt"):
@@ -550,8 +575,16 @@ class AccountManager:
             return
 
         logger.info(f"Starting {len(self.accounts)} monitors")
+        
+        # Send startup notification
+        account_names = "\n".join([f"  👤 {acc['name']}" for acc in self.accounts])
         await self.telegram.send(
-            f"🚀 <b>Starting {len(self.accounts)} monitors</b>",
+            f"🚀 <b>Discord Join Monitor Starting</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 <b>Accounts:</b> {len(self.accounts)}\n"
+            f"{account_names}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏰ <b>Started:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             "System"
         )
 
