@@ -17,9 +17,10 @@ import requests
 # Try importing discord.py-self
 try:
     import discord
-    from discord import Intents, Client
+    from discord import Client
     logger = logging.getLogger(__name__)
     logger.info("✅ discord.py-self loaded successfully")
+    print(f"✅ discord.py-self version: {discord.__version__}")
 except ImportError as e:
     print(f"❌ Error importing discord.py-self: {e}")
     print("Please install: pip install discord.py-self")
@@ -71,13 +72,8 @@ notifier = TelegramNotifier()
 # ===== DISCORD CLIENT =====
 class JoinMonitor(discord.Client):
     def __init__(self, account_name: str):
-        # Use Intents correctly
-        intents = discord.Intents.default()
-        intents.members = True
-        intents.guilds = True
-        intents.message_content = True
-        
-        super().__init__(intents=intents)
+        # Use discord.Client directly without Intents (discord.py-self handles this differently)
+        super().__init__()
         self.account_name = account_name
         self.ready_sent = False
 
