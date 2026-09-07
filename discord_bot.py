@@ -87,7 +87,8 @@ class DiscordGateway:
         self._reconnect_attempt = 0
         self._subscribed_guilds = set()
         self._gateway_url = None
-        self._buffer = b""  # For handling fragmented messages
+        self._buffer = b""
+        self._ready_received = False
         
     async def connect(self):
         """Connect to Discord WebSocket"""
@@ -105,15 +106,14 @@ class DiscordGateway:
         
         logger.info(f"{self.label}: 🔌 Connecting to Discord WebSocket...")
         try:
-            # Connect with increased message size limit
             self.ws = await websockets.connect(
                 gateway_url,
                 user_agent_header="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                compression=None,  # Disable compression to avoid issues
+                compression=None,
                 ping_interval=20,
                 ping_timeout=10,
                 close_timeout=10,
-                max_size=2**26  # 64MB limit for large messages
+                max_size=2**26
             )
             logger.info(f"{self.label}: ✅ WebSocket connected")
         except Exception as e:
@@ -160,6 +160,10 @@ class DiscordGateway:
         logger.warning(f"{self.label}: Using fallback gateway: {fallback}")
         return fallback
     
+    def _is_ws_connected(self):
+        """Check if WebSocket is connected"""
+        return self.ws is not None and not self.ws.closed
+    
     async def _receive_loop(self):
         """Main receive loop"""
         while self._running:
@@ -168,11 +172,9 @@ class DiscordGateway:
                 
                 # Handle different message types
                 if isinstance(message, bytes):
-                    # Try to decode as UTF-8
                     try:
                         message = message.decode('utf-8')
                     except UnicodeDecodeError:
-                        # Try zlib decompression
                         try:
                             decompressed = zlib.decompress(message)
                             message = decompressed.decode('utf-8')
@@ -188,7 +190,6 @@ class DiscordGateway:
                 try:
                     data = json.loads(message)
                 except json.JSONDecodeError as e:
-                    # Try to handle fragmented messages
                     if len(message) > 0:
                         logger.warning(f"{self.label}: Invalid JSON: {e}")
                     continue
@@ -252,6 +253,7 @@ class DiscordGateway:
         """Handle dispatched events"""
         
         if event_type == "READY":
+            self._ready_received = True
             user = data.get('user', {})
             self._user_id = user.get('id')
             self._username = user.get('username')
@@ -310,7 +312,8 @@ class DiscordGateway:
             if guild_id:
                 self._guilds[guild_id] = guild_name
                 logger.info(f"{self.label}: 📁 Cached: {guild_name}")
-                await self._subscribe_to_guild(guild_id)
+                if guild_id not in self._subscribed_guilds:
+                    await self._subscribe_to_guild(guild_id)
             
         elif event_type == "GUILD_MEMBER_ADD":
             # THIS IS THE EVENT WE WANT!
@@ -354,7 +357,7 @@ class DiscordGateway:
         # Log all events for debugging
         if event_type and event_type not in ["PRESENCE_UPDATE", "TYPING_START"]:
             logger.debug(f"{self.label}: 📨 Event: {event_type}")
-    
+
     async def _subscribe_to_guild(self, guild_id: str):
         """Subscribe to guild members using Opcode 14"""
         if guild_id in self._subscribed_guilds:
@@ -393,7 +396,7 @@ class DiscordGateway:
                     "activities": [],
                     "afk": False
                 },
-                "compress": True,  # Enable compression for large payloads
+                "compress": True,
                 "large_threshold": 250,
                 "client_state": {
                     "guild_versions": {},
@@ -467,7 +470,7 @@ class DiscordGateway:
         """Heartbeat loop"""
         while self._running:
             await asyncio.sleep(self._heartbeat_interval + random.uniform(-0.15, 0.15))
-            if self.ws and self._connected:
+            if self._is_ws_connected() and self._connected:
                 await self._send_heartbeat()
     
     async def _reconnect(self):
@@ -476,6 +479,7 @@ class DiscordGateway:
         delay = min(30, 2 ** self._reconnect_attempt)
         logger.info(f"{self.label}: 🔄 Reconnecting in {delay}s...")
         self._connected = False
+        self._ready_received = False
         await self.close()
         await asyncio.sleep(delay)
         await self.connect()
@@ -562,7 +566,7 @@ class AccountManager:
 
         while self._running:
             await asyncio.sleep(60)
-            connected = sum(1 for g in self.gateways if g.ws and not g.ws.closed and g._connected)
+            connected = sum(1 for g in self.gateways if g._is_ws_connected() and g._connected)
             total = len(self.gateways)
             logger.info(f"📊 Status: {connected}/{total} connected")
 
@@ -593,4 +597,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nClosed.")
-      
