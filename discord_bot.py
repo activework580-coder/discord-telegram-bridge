@@ -31,7 +31,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ===== CREDENTIALS (Load from environment) =====
-DISCORD_USER_TOKEN = os.getenv("DISCORD_TOKEN")
+DISCORD_USER_TOKEN = os.getenv("MTI1MTkyODY3NTE2MzgzNjU2MA.GqpILO.tDRKP_6PIbtOxgr0DMglU_8o3IN2jDUi29gK1I")
 TELEGRAM_BOT_TOKEN = os.getenv("8897870104:AAFc1JvC1am81WbUhyJsyI2Pe8wUwc50bJw")
 TELEGRAM_CHAT_ID = os.getenv("8591595853")
 PROXY_URL = os.getenv("PROXY_URL")
