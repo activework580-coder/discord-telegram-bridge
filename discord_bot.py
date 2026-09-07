@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+
+"""
+Tier 3 Server Join Monitor - REPAIRED PRODUCTION BUILD
+Receives GUILD_MEMBER_ADD with user tokens via Opcode 14 subscriptions
+"""
+
 import asyncio
 import json
 import os
@@ -7,418 +14,452 @@ import base64
 import hashlib
 import logging
 import threading
-import signal
-import sys
 from datetime import datetime
-from typing import Optional, Dict, Any
 from flask import Flask, jsonify
 from curl_cffi import requests as curl_requests
-from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
-
-# ===== LOGGING CONFIGURATION =====
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('discord_monitor.log')
-    ]
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
 
-# ===== CREDENTIALS (Load from environment) =====
-DISCORD_USER_TOKEN = os.getenv("MTI1MTkyODY3NTE2MzgzNjU2MA.GqpILO.tDRKP_6PIbtOxgr0DMglU_8o3IN2jDUi29gK1I")
-TELEGRAM_BOT_TOKEN = os.getenv("8897870104:AAFc1JvC1am81WbUhyJsyI2Pe8wUwc50bJw")
-TELEGRAM_CHAT_ID = os.getenv("8591595853")
-PROXY_URL = os.getenv("PROXY_URL")
-PORT = int(os.getenv("PORT", 10000))
+# ====== HARDCODED CREDENTIALS ======
+TELEGRAM_BOT_TOKEN = "8897870104:AAFc1JvC1am81WbUhyJsyI2Pe8wUwc50bJw"
+TELEGRAM_CHAT_ID = "8591595853"
+PROXY_URL = None  # Set your proxy here if needed: "http://user:pass@host:port"
+HEARTBEAT_JITTER = 0.15
 
-# Validate required credentials
-if not DISCORD_USER_TOKEN:
-    raise ValueError("DISCORD_TOKEN environment variable is required")
-if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    logger.warning("Telegram credentials not set. Notifications will be disabled.")
-
-# ===== FLASK WEB SERVER =====
+# ====== FLASK WEB SERVER ======
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return jsonify({
-        "status": "active",
-        "mode": "Passive Join Listener",
-        "uptime": time.time() - START_TIME
-    })
+    return jsonify({'status': 'running', 'mode': 'Tier 3 Server Join Monitor'})
 
 @app.route('/health')
 def health():
-    return jsonify({
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat()
-    }), 200
+    return jsonify({'status': 'healthy'})
 
 def run_flask():
     logging.getLogger('werkzeug').setLevel(logging.ERROR)
-    app.run(host='0.0.0.0', port=PORT)
+    app.run(host='0.0.0.0', port=int(os.getenv("PORT", 10000)))
 
-# ===== TELEGRAM NOTIFIER =====
-class TelegramNotifier:
+# ======= TELEGRAM SERVICE =======
+class TelegramService:
     def __init__(self):
-        self.session: Optional[curl_requests.AsyncSession] = None
-        self.enabled = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
-        self.rate_limit_delay = 1.0  # Minimum seconds between messages
-        self.last_send_time = 0
+        self._session = None
+        self._last_sent = 0
+        self._min_interval = 0.5
 
-    async def _ensure_session(self):
-        if not self.session:
-            self.session = curl_requests.AsyncSession(impersonate="chrome120")
-        return self.session
+    async def _get_session(self):
+        if self._session is None:
+            self._session = curl_requests.AsyncSession(impersonate="chrome")
+        return self._session
 
-    async def send_alert(self, text: str):
-        """Send alert with rate limiting"""
-        if not self.enabled:
-            logger.info(f"Alert (Telegram disabled): {text}")
-            return
-
-        # Rate limiting
-        current_time = time.time()
-        if current_time - self.last_send_time < self.rate_limit_delay:
-            await asyncio.sleep(self.rate_limit_delay - (current_time - self.last_send_time))
-
-        session = await self._ensure_session()
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text[:4000],  # Telegram message limit
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        }
-        
+    async def send(self, text: str, account_label: str = None):
+        if account_label:
+            text = f'<b>{account_label}</b>: {text}'
+        now = time.time()
+        if now - self._last_sent < self._min_interval:
+            await asyncio.sleep(self._min_interval - (now - self._last_sent))
+        self._last_sent = time.time()
         try:
-            res = await session.post(url, json=payload, timeout=10)
-            if res.status_code == 200:
-                self.last_send_time = time.time()
-                logger.info("📨 Alert forwarded to Telegram")
-            else:
-                logger.error(f"Telegram API error: {res.status_code} - {res.text}")
+            session = await self._get_session()
+            await session.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID, 
+                    "text": text, 
+                    "parse_mode": "HTML"
+                }
+            )
+            logger.info(f"Telegram alert dispatched successfully.")
+            return True
         except Exception as e:
-            logger.error(f"Telegram dispatch error: {e}")
+            logger.error(f"Telegram error: {e}")
+            return False
 
-# ===== DEVICE FINGERPRINT GENERATOR =====
-def generate_client_fingerprint(token: str) -> tuple[Dict[str, Any], str]:
-    """Generate deterministic browser fingerprint based on token"""
-    hasher = hashlib.sha256(token.encode()).hexdigest()
-    installation_id = f"{hasher[0:8]}-{hasher[8:12]}-{hasher[12:16]}-{hasher[16:20]}-{hasher[20:32]}"
-    
-    properties = {
+    async def close(self):
+        if self._session:
+            await self._session.close()
+
+# ======= FINGERPRINT GENERATOR =======
+def generate_installation_id(token: str) -> str:
+    hasher = hashlib.md5(token.encode('utf-8')).hexdigest()
+    return f"{hasher[0:8]}-{hasher[8:12]}-{hasher[12:16]}-{hasher[16:20]}-{hasher[20:32]}"
+
+def generate_fingerprint(account_index: int, token: str = None):
+    random.seed(account_index * 777 + 13)
+    installation_id = generate_installation_id(token) if token else f"a90fldca-7e83-4b9d-{random.randint(1000, 5000)}"
+    return {
         "os": "Windows",
         "browser": "Chrome",
-        "device": "",
+        "device": " ",
         "system_locale": "en-US",
-        "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)",
         "browser_version": "126.0.0.0",
         "os_version": "10.0.22621",
         "referrer": "",
         "referring_domain": "",
+        "referrer_current": "",
+        "referring_domain_current": "",
         "release_channel": "stable",
         "client_build_number": 287275,
         "client_event_source": None,
+        "architecture": "x64",
+        "launch_signature": base64.b64encode(random.randbytes(8)).decode('utf-8'),
+        "has_client_mods": False,
         "installation_id": installation_id
     }
-    encoded = base64.b64encode(json.dumps(properties).encode()).decode()
-    return properties, encoded
 
-# ===== DISCORD GATEWAY =====
-class PassiveDiscordGateway:
-    def __init__(self, token: str, notifier: TelegramNotifier):
+# ====== DISCORD GATEWAY ======
+class DiscordGateway:
+    def __init__(self, token: str, label: str, account_index: int, telegram: TelegramService):
         self.token = token
-        self.notifier = notifier
+        self.label = label
+        self.account_index = account_index
+        self.telegram = telegram
         self.ws = None
-        self.session = None
-        self.running = True
-        self.seq = 0
-        self.heartbeat_interval = 41.25
+        self._session = None
+        self._running = True
+        self._seq = 0
+        self._heartbeat_interval = 41.25
+        self._connected = False
+        self._heartbeat_task = None
+        self._reconnect_attempt = 0
         self.is_connected = False
-        self.guilds_cache: Dict[str, str] = {}
-        self.last_msg_time = time.time()
-        self.reconnect_attempts = 0
-        self.max_reconnect_attempts = 10
-        self.props, self.props_encoded = generate_client_fingerprint(token)
+        self._guilds = {}
+        self._invalid_token = False
+        self._ready_received = False
+        self._subscribed_guilds = set()
+
+    async def run(self):
+        while self._running and not self._invalid_token:
+            await self.connect()
+            if not self._running:
+                break
+            await asyncio.sleep(random.uniform(1, 5))
 
     async def connect(self):
-        """Main connection loop with reconnection logic"""
+        if not self.token or len(self.token) < 20:
+            logger.error(f"{self.label}: Invalid token string structure.")
+            await self.telegram.send(f"❌ Token is invalid", self.label)
+            self._invalid_token = True
+            self._running = False
+            return
+
+        fingerprint = generate_fingerprint(self.account_index, self.token)
+        encoded_props = base64.b64encode(json.dumps(fingerprint).encode()).decode('utf-8')
+
         headers = {
-            "User-Agent": self.props["browser_user_agent"],
+            "User-Agent": fingerprint["browser_user_agent"],
             "Origin": "https://discord.com",
-            "X-Super-Properties": self.props_encoded
+            "X-Super-Properties": encoded_props,
+            "X-Discord-Device-Id": hashlib.sha256(f"{self.token}_{self.account_index}".encode()).hexdigest()[1:5]
         }
 
         try:
-            self.session = curl_requests.AsyncSession(
-                impersonate="chrome120",
-                proxies={"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None,
-                timeout=30
+            self._session = curl_requests.AsyncSession(
+                impersonate="chrome",
+                proxies={"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
             )
-            
-            async with self.session.ws_connect(
-                "wss://gateway.discord.gg/?v=9&encoding=json",
+            self.ws = await self._session.ws_connect(
+                url="wss://gateway.discord.gg/?v=9&encoding=json",
                 headers=headers
-            ) as ws:
-                self.ws = ws
-                self.last_msg_time = time.time()
-                self.reconnect_attempts = 0
-                logger.info("WebSocket connection established")
-                
-                async for message in ws:
-                    self.last_msg_time = time.time()
-                    if not message:
-                        continue
-                    
-                    try:
-                        data = json.loads(message)
-                    except json.JSONDecodeError:
-                        logger.warning("Failed to decode WebSocket message")
-                        continue
-                    
-                    op = data.get('op')
-                    t = data.get('t')
-                    d = data.get('d', {})
-
-                    if op == 0:  # Dispatch
-                        self.seq = data.get('s', self.seq)
-                        await self._parse_event(t, d)
-                    elif op == 1:  # Heartbeat
-                        await self._send_heartbeat()
-                    elif op == 7:  # Reconnect
-                        logger.warning("Reconnect signal received from Discord")
-                        break
-                    elif op == 9:  # Invalid session
-                        logger.warning("Invalid session, re-identifying")
-                        await self._send_identify()
-                    elif op == 10:  # Hello
-                        self.heartbeat_interval = d['heartbeat_interval'] / 1000.0
-                        self._start_heartbeat_task()
-                        await self._send_identify()
-                        self.is_connected = True
-
-        except Exception as e:
-            logger.error(f"Gateway error: {e}")
-        
-        self.is_connected = False
-        await self._handle_reconnect()
-
-    async def _handle_reconnect(self):
-        """Handle reconnection with exponential backoff"""
-        self.reconnect_attempts += 1
-        
-        if self.reconnect_attempts > self.max_reconnect_attempts:
-            logger.critical("Max reconnection attempts reached. Restarting...")
-            await asyncio.sleep(30)
-            self.reconnect_attempts = 0
-        
-        backoff = min(2 ** self.reconnect_attempts, 60)
-        jitter = random.uniform(0, 1)
-        delay = backoff + jitter
-        
-        logger.info(f"Reconnecting in {delay:.2f} seconds (attempt {self.reconnect_attempts})")
-        await asyncio.sleep(delay)
-
-    def _start_heartbeat_task(self):
-        """Start heartbeat loop if not already running"""
-        if not hasattr(self, '_heartbeat_task') or self._heartbeat_task.done():
+            )
+            logger.info(f"{self.label}: Connected to Discord Gateway.")
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            await self._receive_loop()
+        except Exception as e:
+            logger.error(f"{self.label}: Connection runtime failure: {e}")
+            if "401" in str(e) or "invalid" in str(e).lower():
+                await self.telegram.send(f"❌ Token status indicates invalid authentication", self.label)
+                self._invalid_token = True
+                self._running = False
+            else:
+                await self._reconnect()
 
-    async def _send_identify(self):
-        payload = {
+    async def _receive_loop(self):
+        while self._running:
+            try:
+                raw = await asyncio.wait_for(self.ws.recv(), timeout=45)
+                if raw is None:
+                    continue
+                
+                if isinstance(raw, tuple):
+                    binary_payload = raw if len(raw) > 0 else b""
+                elif hasattr(raw, "data"):
+                    binary_payload = raw.data
+                else:
+                    binary_payload = raw
+
+                if isinstance(binary_payload, bytes):
+                    message = binary_payload.decode('utf-8', errors='ignore')
+                else:
+                    message = str(binary_payload)
+
+                if not message.strip():
+                    continue
+
+                data = json.loads(message)
+                op = data.get('op')
+                t = data.get('t')
+                d = data.get('d', {})
+
+                if op == 0:
+                    self._seq = data.get('s', self._seq)
+                    await self._handle_event(t, d)
+                elif op == 1:
+                    await self._send_heartbeat()
+                elif op == 7:
+                    logger.info(f"{self.label}: Server synchronization reset requested.")
+                    await self._reconnect()
+                    return
+                elif op == 9:
+                    if d is False:
+                        logger.error(f"{self.label}: Handshake rejected.")
+                        await self.telegram.send(f"❌ Authorization tracking dropped", self.label)
+                        self._invalid_token = True
+                        self._running = False
+                        return
+                    else:
+                        await self._send_identity()
+                elif op == 10:
+                    self._heartbeat_interval = d['heartbeat_interval'] / 1000.0
+                    await self._send_identity()
+                    self._connected = True
+                    self.is_connected = True
+                    logger.info(f"{self.label}: Handshake authorization validated.")
+                elif op == 11:
+                    pass
+            except asyncio.TimeoutError:
+                await self._send_heartbeat()
+            except Exception as e:
+                if "closed" in str(e).lower():
+                    logger.warning(f"{self.label}: Link termination observed.")
+                    await self._reconnect()
+                    return
+                else:
+                    logger.error(f"{self.label}: Exception captured in network framework reader: {e}")
+                    await self._reconnect()
+                    return
+
+    async def _heartbeat_loop(self):
+        while self._running:
+            await asyncio.sleep(self._heartbeat_interval + random.uniform(-HEARTBEAT_JITTER, HEARTBEAT_JITTER))
+            if self._connected:
+                await self._send_heartbeat()
+
+    async def _send_heartbeat(self):
+        if self.ws:
+            try:
+                await self.ws.send(json.dumps({"op": 1, "d": self._seq}))
+            except Exception as e:
+                logger.error(f"{self.label}: Heartbeat send failed: {e}")
+
+    async def _send_identity(self):
+        fingerprint = generate_fingerprint(self.account_index, self.token)
+        identity = {
             "op": 2,
             "d": {
                 "token": self.token,
-                "capabilities": 16381,
-                "properties": self.props,
-                "compress": False,
-                "large_threshold": 100,
-                "guild_subscriptions": True,
+                "properties": fingerprint,
                 "presence": {
-                    "status": "invisible",  # More discrete than "online"
+                    "status": "online",
                     "since": 0,
                     "activities": [],
                     "afk": False
                 },
+                "compress": False,
+                "large_threshold": 250,
                 "client_state": {
                     "guild_versions": {},
                     "highest_last_message_id": "0",
                     "read_state_version": 0,
-                    "user_guild_settings_version": -1,
-                    "user_settings_version": 0,
-                    "private_channels_version": 0,
-                    "api_code_version": 0
+                    "user_guild_settings_version": 0,
+                    "user_settings_version": 0
                 }
             }
         }
-        await self.ws.send(json.dumps(payload))
-        logger.info("IDENTIFY packet sent")
+        await self.ws.send(json.dumps(identity))
 
     async def _subscribe_to_guild(self, guild_id: str):
-        """Subscribe to guild events with rate limiting"""
-        payload = {
+        lazy_subscription = {
             "op": 14,
             "d": {
                 "guild_id": guild_id,
-                "typing": False,  # Disable unnecessary events
+                "typing": True,
                 "threads": True,
-                "activities": False,  # Reduce bandwidth
+                "activities": True,
                 "members": [],
                 "channels": {}
             }
         }
-        await self.ws.send(json.dumps(payload))
-        logger.debug(f"Subscribed to guild {guild_id}")
+        await self.ws.send(json.dumps(lazy_subscription))
+        self._subscribed_guilds.add(guild_id)
+        logger.info(f"{self.label}: Opcode 14 Lazy-Guild Subscription sent for server ID {guild_id}")
 
-    async def _parse_event(self, event_type: str, data: dict):
-        """Handle Discord gateway events"""
-        if event_type == 'READY':
-            logger.info("Successfully authenticated to Discord gateway")
+    async def _handle_event(self, event_type: str, data: dict):
+        if event_type == "READY":
+            self._ready_received = True
             guilds = data.get('guilds', [])
-            logger.info(f"Monitoring {len(guilds)} guilds")
-            
-            # Process guilds in batches to avoid rate limits
-            batch_size = 5
-            for i in range(0, len(guilds), batch_size):
-                batch = guilds[i:i+batch_size]
-                for g in batch:
-                    if 'id' in g and 'name' in g:
-                        self.guilds_cache[g['id']] = g['name']
-                        await asyncio.sleep(random.uniform(0.3, 0.6))
-                        await self._subscribe_to_guild(g['id'])
-                
-                # Wait between batches
-                if i + batch_size < len(guilds):
-                    await asyncio.sleep(random.uniform(1, 2))
+            for g in guilds:
+                if 'id' in g:
+                    self._guilds[g['id']] = g.get('name', 'Populating Name...')
+            user = data.get('user', {})
+            username = user.get('username', 'Unknown')
+            logger.info(f"{self.label}: Initial gateway connection authenticated as {username}")
+            await self.telegram.send(
+                f"✅ <b>Online</b> | Processing gateway room parameters...\n"
+                f"👤 User: <code>{username}</code>",
+                self.label
+            )
+            for guild in guilds:
+                guild_id = guild.get('id')
+                if guild_id:
+                    await asyncio.sleep(random.uniform(0.5, 1.2))
+                    await self._subscribe_to_guild(guild_id)
 
         elif event_type == 'GUILD_CREATE':
             g_id = data.get('id')
             g_name = data.get('name')
             if g_id and g_name:
-                self.guilds_cache[g_id] = g_name
-                # Subscribe if not already subscribed
-                await self._subscribe_to_guild(g_id)
+                self._guilds[g_id] = g_name
+                logger.info(f"{self.label} Cache Synced: mapped ID {g_id} to name '{g_name}'")
 
         elif event_type == 'GUILD_MEMBER_ADD':
-            await self._handle_member_join(data)
+            guild_id = data.get('guild_id')
+            user = data.get('user', {})
+            guild_name = self._guilds.get(guild_id, f'Server ({guild_id})')
+            username = user.get('username', 'Unknown')
+            user_id = user.get('id', 'Unknown')
+            avatar_hash = user.get('avatar', '')
+            
+            alert = (
+                f"🆕 <b>New Discord Join!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏠 <b>Server:</b> <code>{guild_name}</code>\n"
+                f"👤 <b>User:</b> <code>{username}</code>\n"
+                f"🆔 <b>User ID:</b> <code>{user_id}</code>\n"
+            )
+            
+            if avatar_hash:
+                alert += f"🖼️ <b>Avatar:</b> <a href='https://cdn.discordapp.com/avatars/{user_id}/{avatar_hash}.png'>Link</a>\n"
+            
+            alert += f"━━━━━━━━━━━━━━━━━━━━\n"
+            alert += f"⏰ <b>Time:</b> <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+            
+            logger.info(f"{self.label}: New member joined {guild_name} - {username} ({user_id})")
+            await self.telegram.send(alert, self.label)
 
-    async def _handle_member_join(self, data: dict):
-        """Handle new member join events"""
-        guild_id = data.get('guild_id')
-        user = data.get('user', {})
-        guild_name = self.guilds_cache.get(guild_id, f"Server ({guild_id})")
-        username = user.get('username', 'Unknown User')
-        user_id = user.get('id', 'Unknown ID')
-        
-        alert_text = (
-            f"🚨 <b>New Discord Join Detected!</b>\n\n"
-            f"🏠 <b>Server:</b> {guild_name}\n"
-            f"👤 <b>User:</b> {username}\n"
-            f"🆔 <b>User ID:</b> <code>{user_id}</code>\n"
-            f"⏰ <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        
-        logger.info(f"New member {username} joined {guild_name}")
-        await self.notifier.send_alert(alert_text)
+    async def _reconnect(self):
+        logger.info(f"{self.label}: Attempting reconnection...")
+        await self.close()
+        self._reconnect_attempt += 1
+        delay = min(30, 2 ** self._reconnect_attempt)
+        await asyncio.sleep(delay)
 
-    async def _send_heartbeat(self):
-        """Send heartbeat packet"""
-        if self.ws:
-            try:
-                await self.ws.send(json.dumps({"op": 1, "d": self.seq}))
-            except Exception as e:
-                logger.error(f"Heartbeat send failed: {e}")
-
-    async def _heartbeat_loop(self):
-        """Maintain heartbeat with jitter"""
-        while self.is_connected:
-            jitter = random.uniform(0.85, 1.15)
-            await asyncio.sleep(self.heartbeat_interval * jitter)
-            if self.is_connected:
-                await self._send_heartbeat()
-
-    async def cleanup(self):
-        """Clean up resources"""
-        self.running = False
-        self.is_connected = False
+    async def close(self):
+        self._running = False
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
         if self.ws:
             try:
                 await self.ws.close()
-            except:
+            except Exception:
                 pass
-        if self.session:
-            try:
-                await self.session.close()
-            except:
-                pass
+        if self._session:
+            await self._session.close()
 
-# ===== MAIN MONITOR LOOP =====
-START_TIME = time.time()
-gateway_instance = None
+# ====== ACCOUNT MANAGER ======
+class AccountManager:
+    def __init__(self):
+        self.accounts = []
+        self.gateways = []
+        self.telegram = TelegramService()
 
-async def run_monitor():
-    """Main monitoring loop"""
-    global gateway_instance
-    
-    notifier = TelegramNotifier()
-    gateway = PassiveDiscordGateway(DISCORD_USER_TOKEN, notifier)
-    gateway_instance = gateway
-    
-    # Graceful shutdown handler
-    def signal_handler(sig, frame):
-        logger.info("Shutdown signal received")
-        asyncio.create_task(gateway.cleanup())
-        sys.exit(0)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    # Watchdog task
-    async def watchdog():
+    def load_accounts(self):
+        """Load Discord tokens from tokens.txt file"""
+        if os.path.exists("tokens.txt"):
+            with open("tokens.txt", "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and ":" in line:
+                        name, token = line.split(":", 1)
+                        self.accounts.append({"name": name.strip(), "token": token.strip()})
+                        logger.info(f"Loaded account: {name.strip()}")
+        else:
+            logger.warning("tokens.txt file not found!")
+            
+        return self.accounts
+
+    async def start_all(self):
+        self.accounts = self.load_accounts()
+        if not self.accounts:
+            logger.error("No accounts loaded from tokens.txt")
+            await self.telegram.send(
+                "❌ <b>No Discord tokens found!</b>\n"
+                "Please create a <code>tokens.txt</code> file with format:\n"
+                "<code>AccountName:TOKEN_HERE</code>",
+                "System"
+            )
+            return
+
+        logger.info(f"Initializing tracking loops for {len(self.accounts)} accounts.")
+        await self.telegram.send(
+            f"🚀 <b>Starting {len(self.accounts)} server join monitors</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 <b>Status:</b> Initializing...",
+            "System"
+        )
+
+        for idx, acc in enumerate(self.accounts):
+            if idx > 0:
+                stagger = random.uniform(2, 5)
+                logger.info(f"Waiting {stagger:.1f}s before starting {acc['name']}")
+                await asyncio.sleep(stagger)
+            gateway = DiscordGateway(acc["token"], acc["name"], idx, self.telegram)
+            self.gateways.append(gateway)
+            asyncio.create_task(gateway.run())
+
         while True:
-            await asyncio.sleep(30)
-            if gateway.is_connected and (time.time() - gateway.last_msg_time > 120):
-                logger.warning("Connection appears stalled, forcing reconnect")
-                gateway.is_connected = False
-                # Force reconnect by closing websocket
-                if gateway.ws:
-                    try:
-                        await gateway.ws.close()
-                    except:
-                        pass
-    
-    watchdog_task = asyncio.create_task(watchdog())
-    
-    # Main connection loop
-    while True:
-        try:
-            logger.info("Starting Discord gateway connection...")
-            await gateway.connect()
-        except KeyboardInterrupt:
-            logger.info("Interrupted by user")
-            break
-        except Exception as e:
-            logger.error(f"Unexpected error in main loop: {e}")
-            await asyncio.sleep(5)
+            await asyncio.sleep(60)
+            connected = sum(1 for g in self.gateways if g.is_connected)
+            total = len(self.gateways)
+            logger.info(f"Live Diagnostics: {connected}/{total} channels active.")
+            
+            if connected == total and total > 0:
+                await self.telegram.send(
+                    f"✅ <b>All systems operational</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 <b>Active Monitors:</b> <code>{connected}/{total}</code>\n"
+                    f"⏰ <b>Uptime:</b> <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>",
+                    "System"
+                )
+
+    async def cleanup(self):
+        for g in self.gateways:
+            await g.close()
+        await self.telegram.close()
+
+# ====== MAIN ======
+async def main():
+    print("=" * 50)
+    print("■ Tier 3 Server Join Monitor - PRODUCTION READY")
+    print("=" * 50)
+    threading.Thread(target=run_flask, daemon=True).start()
+    manager = AccountManager()
+    try:
+        await manager.start_all()
+    except KeyboardInterrupt:
+        logger.info("Termination sequence initiated...")
+    finally:
+        await manager.cleanup()
 
 if __name__ == "__main__":
-    # Start Flask server in background
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    
-    # Run the async monitor
     try:
-        asyncio.run(run_monitor())
+        asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Shutting down...")
-    except Exception as e:
-        logger.critical(f"Fatal error: {e}")
-        sys.exit(1)
+        print("\nProcess Closed Cleanly.")
